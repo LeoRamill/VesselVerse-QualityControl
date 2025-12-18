@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, random_split
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
 from models.multi_resnet import MultiViewResNet
 from preprocess.mra_processing import MRAVesselMultiViewDataset
-from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb, poly_lr_scheduler
+from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb, poly_lr_scheduler, select_optimizer
 
 
 def validation(model, val_loader, device, criterion, log_images=True, images_per_epoch=20, step=None):
@@ -292,7 +292,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--epochs", type=int, default=50)
-
+    
+    parser.add_argument("--optimizer", type=str, default='sgd')
     parser.add_argument("--lr", type=float, default=2.5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -359,11 +360,7 @@ def main():
         hidden_dim=args.hidden_dim,
     ).to(device)
 
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = select_optimizer(args, model)
     # Start training
     best_val_acc = training(
         model=model,

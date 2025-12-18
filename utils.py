@@ -2,6 +2,39 @@ import numpy as np
 import torch
 import wandb
 import matplotlib.pyplot as plt
+from torch.optim import SGD, Adam, RMSprop
+
+def select_optimizer(args, model):
+    """
+    Choose optimizers: RMSprop, SGD, Adam.
+
+    Parameters
+    ----------
+        args: argparse.Namespace
+            Must expose optimizer choice plus LR, momentum, and weight_decay values.
+        model: torch.nn.Module
+            Model whose parameters will be optimized.
+
+    Returns
+    -------
+        torch.optim.Optimizer | None
+            Configured optimizer instance, or None if the choice is unsupported.
+    """
+    if args.optimizer == 'rmsprop':
+        optimizer = RMSprop(model.parameters(), args.lr)
+    elif args.optimizer == 'sgd':
+        optimizer = SGD(
+            model.parameters(),
+            args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+    elif args.optimizer == 'adam':
+        optimizer = Adam(model.parameters(), args.lr, weight_decay=args.weight_decay)
+    else:  
+        print('not supported optimizer \n')
+        return None
+    return optimizer
 
 
 def poly_lr_scheduler(optimizer, init_lr, iter, lr_decay_iter=1, max_iter=50, power=0.9):
