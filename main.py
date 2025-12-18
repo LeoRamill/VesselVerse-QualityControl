@@ -296,6 +296,7 @@ def main():
     parser.add_argument("--optimizer", type=str, default='sgd')
     parser.add_argument("--lr", type=float, default=2.5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--backbone", type=str, default="resnet18")
