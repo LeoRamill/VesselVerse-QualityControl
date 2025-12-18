@@ -12,7 +12,7 @@
 
 - Python 3.9+
 - PyTorch 2.0+ 
-- Git & Git LFS (for large medical imaging assets)
+- Git
 - Weights & Biases account (optional but recommended)
 
 
