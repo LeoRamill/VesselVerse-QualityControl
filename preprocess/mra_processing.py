@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 from PIL import Image
-
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -18,7 +18,8 @@ class MRAVesselMultiViewDataset(Dataset):
                 "sagittal":  tensor [3, 224, 224],
                 "coronal":   tensor [3, 224, 224],
                 "label":     tensor scalar (0.0/1.0),
-                "id":        string identifier
+                "id":        string identifier  (e.g., "Normal063-MRA_MANUAL"),
+                "tabular":   tensor [num_tabular_features],
             }
     """
 
@@ -27,7 +28,11 @@ class MRAVesselMultiViewDataset(Dataset):
         root_dir: str,
         excel_path: str,
         label_col: str = "label2",
+        id_col: str = "file_sorgente",
         transform=None,
+        tabular_cols=None,
+        tabular_scaler=None,
+        drop_cols=None,
     ):
         """
         Parameters
@@ -38,12 +43,26 @@ class MRAVesselMultiViewDataset(Dataset):
             Path to the Excel file that lists each subject and its label.
         label_col : str, optional
             Name of the column in the Excel sheet that stores the target.
+        id_col : str, optional
+            Name of the column in the Excel sheet that stores the subject identifier.
         transform : callable, optional
             Transform applied to every loaded image.
+        tabular_cols : list[str], optional
+            List of column names to use as tabular features. If None, all numeric
+            columns except those in `drop_cols` are used.
+        tabular_scaler : sklearn.preprocessing object, optional
+            Scaler object (e.g., StandardScaler) fitted on the training tabular data.
+            If provided, it is used to transform the tabular features.
+        drop_cols : list[str], optional
+            List of column names to exclude from tabular features.
         """
         self.root_dir = root_dir
         self.excel_path = excel_path
         self.label_col = label_col
+        self.id_col = id_col
+        self.tabular_cols = tabular_cols
+        self.drop_cols = drop_cols
+        self.tabular_scaler = tabular_scaler
 
         # Load the metadata Excel file once to avoid repeated IO
         self.df = pd.read_excel(self.excel_path)
@@ -61,8 +80,38 @@ class MRAVesselMultiViewDataset(Dataset):
         else:
             self.transform = transform
 
+        if drop_cols is None:
+            drop_cols = [self.id_col, "label1", "label2"]
+        self.drop_cols = set(drop_cols)
+        
+        # Prepare tabular data
+        self._prepare_tabular()
+
         # Pre-compute the list of usable triplets of views
         self.samples = self._build_samples()
+
+    def _prepare_tabular(self):
+        """
+        Prepares the tabular data by selecting specified columns, converting to float32,
+        and applying scaling if a scaler is provided.
+        """
+        if self.tabular_cols is not None:
+            tab_df = self.df[self.tabular_cols].copy()
+        else:
+            numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
+            numeric_cols = [c for c in numeric_cols if c not in self.drop_cols]
+            tab_df = self.df[numeric_cols].copy()
+
+        tab_df = tab_df.astype(np.float32)
+        tab_arr = tab_df.values
+
+        if self.tabular_scaler is not None:
+            tab_arr = self.tabular_scaler.transform(tab_arr)
+
+        self.tabular_df = tab_df
+        self.tabular_arr = tab_arr.astype(np.float32)
+        self.tabular_dim = self.tabular_arr.shape[1]
+
 
     def _build_samples(self):
         """
@@ -73,8 +122,8 @@ class MRAVesselMultiViewDataset(Dataset):
         """
         samples = []
         # Iterate through every subject described in the spreadsheet
-        for _, row in self.df.iterrows():
-            file_id = str(row["file_sorgente"]).strip()  # e.g., "Normal063-MRA_MANUAL"
+        for idx, row in self.df.iterrows():
+            file_id = str(row[self.id_col]).strip()  # e.g., "Normal063-MRA_MANUAL"
             label = float(row[self.label_col])
 
             # Split the identifier into the base study name and the model suffix
@@ -106,6 +155,7 @@ class MRAVesselMultiViewDataset(Dataset):
             if all(os.path.exists(p) for p in paths.values()):
                 samples.append(
                     {
+                        "row_idx": idx, 
                         "id": file_id,   # includes the suffix so we know the model source
                         "paths": paths,
                         "label": label,
@@ -154,7 +204,7 @@ class MRAVesselMultiViewDataset(Dataset):
         Returns
         -------
         dict[str, torch.Tensor | str]
-            Dict containing the three views, the label tensor, and the id.
+            Dict containing the three views, the label tensor, and the id string. 
         """
         sample_info = self.samples[idx]
         paths = sample_info["paths"]
@@ -167,10 +217,13 @@ class MRAVesselMultiViewDataset(Dataset):
 
         label_tensor = torch.tensor(label, dtype=torch.float32)
 
+        tab = self.tabular_arr[sample_info["row_idx"]]
+
         return {
             "axial": axial_img,
             "sagittal": sagittal_img,
             "coronal": coronal_img,
             "label": label_tensor,
-            "id": sample_info["id"],  # e.g., "Normal063-MRA_MANUAL"
+            "id": sample_info["id"],  # e.g., "Normal063-MRA_MANUAL",
+            "tabular": torch.from_numpy(tab).float()
         }

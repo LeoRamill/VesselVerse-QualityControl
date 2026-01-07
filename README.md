@@ -22,7 +22,9 @@
 ```
 VesselVerse-QualityControl/
 ├── models/
+│   ├── mlp.py                 # MLP Tabuler architecture
 │   ├── multi_resnet.py        # Multi-view ResNet architecture 
+│   ├── multi_modal_resnet.py  # MultiModal Model (ResNet+MLP) architecture 
 │   └── model_ML.py            # Traditional ML baselines and plotting helpers
 ├── preprocess/
 │   ├── mra_processing.py      # Multi-view dataset processing for TIFF projections

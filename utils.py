@@ -3,6 +3,8 @@ import torch
 import wandb
 import matplotlib.pyplot as plt
 from torch.optim import SGD, Adam, RMSprop
+from sklearn.model_selection import GroupShuffleSplit
+from torch.utils.data import random_split, Subset
 
 def select_optimizer(args, model):
     """
@@ -35,6 +37,35 @@ def select_optimizer(args, model):
         print('not supported optimizer \n')
         return None
     return optimizer
+
+def select_splitting_strategy(args, dataset):
+    
+    if args.split_strategy == 'random':
+        n_val = int(len(dataset) * args.val_ratio)
+        n_train = len(dataset) - n_val
+        # Split dataset into training and validation sets
+        train_ds, val_ds = random_split(
+            dataset,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(args.seed)
+        )
+    elif args.split_strategy == 'group_wise':
+        sample_ids = [s["id"] for s in dataset.samples]
+        sample_patient_ids = np.array([sid.rsplit("_", 1)[0] for sid in sample_ids])
+        indices = np.arange(len(dataset))
+
+        gss2 = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        train_idx, val_idx = next(gss2.split(indices, groups=sample_patient_ids))
+
+        # check overlap
+        overlap = set(sample_patient_ids[train_idx]).intersection(set(sample_patient_ids[val_idx]))
+        print("Overlap patients train/val:", len(overlap))
+
+        train_ds = Subset(dataset, train_idx)
+        val_ds = Subset(dataset, val_idx)
+        
+    return train_ds, val_ds
+        
 
 
 def poly_lr_scheduler(optimizer, init_lr, iter, lr_decay_iter=1, max_iter=50, power=0.9):

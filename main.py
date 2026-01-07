@@ -2,18 +2,23 @@ import os
 import argparse
 import random
 import numpy as np
+import pandas as pd
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.preprocessing import StandardScaler
 import torch
 import wandb
 import matplotlib.pyplot as plt
 import torch.cuda.amp as amp
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split,  Dataset, Subset
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
 from models.multi_resnet import MultiViewResNet
+from models.multi_modal_resnet import MultiModalMultiViewResNet
+from models.mlp import MLP_tabular
 from preprocess.mra_processing import MRAVesselMultiViewDataset
-from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb, poly_lr_scheduler, select_optimizer
+from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb, poly_lr_scheduler, select_optimizer, select_splitting_strategy
 
 
-def validation(model, val_loader, device, criterion, log_images=True, images_per_epoch=20, step=None):
+def validation(model, val_loader, device, criterion, selected_model, log_images=True, images_per_epoch=20, step=None):
     """
     Run validation for one epoch.
 
@@ -33,6 +38,8 @@ def validation(model, val_loader, device, criterion, log_images=True, images_per
         Device where inference is run.
     criterion : torch.nn.Module
         Loss function (e.g., BCEWithLogitsLoss).
+    selected_model : str
+        Selected model type among {'multi_CNN', 'MLP_tabular', 'multimodal'}.
     log_images : bool, optional
         If True, log example triplets from the first validation batch.
     images_per_epoch : int, optional
@@ -64,11 +71,25 @@ def validation(model, val_loader, device, criterion, log_images=True, images_per
     with torch.no_grad():
         for batch in val_loader:
             # Build the model input dict for multi-view inference.
-            inputs = {
-                "axial": batch["axial"].to(device),
-                "sagittal": batch["sagittal"].to(device),
-                "coronal": batch["coronal"].to(device),
-            }
+            if selected_model == 'MLP_tabular':
+                inputs = {
+                    "tabular": batch["tabular"].to(device),
+                }
+            elif selected_model == 'multi_CNN':
+                inputs = {
+                    "axial": batch["axial"].to(device),
+                    "sagittal": batch["sagittal"].to(device),
+                    "coronal": batch["coronal"].to(device),
+                }
+            elif selected_model == 'multimodal':
+                inputs = {
+                    "axial": batch["axial"].to(device),
+                    "sagittal": batch["sagittal"].to(device),
+                    "coronal": batch["coronal"].to(device),
+                    "tabular": batch["tabular"].to(device),
+                }
+            else:
+                raise ValueError(f"Selected model '{selected_model}' not supported.")
             labels = batch["label"].to(device)
 
             # Forward pass
@@ -135,6 +156,7 @@ def training(
     save_dir="./checkpoints",
     use_amp=True,
     images_per_epoch=20,
+    selected_model='multimodal',
 ):
     """
     Train a multi-view model validate each epoch.
@@ -160,6 +182,8 @@ def training(
         Enable AMP on CUDA for faster training and lower memory usage.
     images_per_epoch : int, optional
         Number of validation images (three views) to log via wandb each epoch.
+    selected_model : str, optional
+        Selected model type among {'multi_CNN', 'MLP_tabular', 'multimodal'}.
 
     Returns
     -------
@@ -191,11 +215,25 @@ def training(
 
         for batch in train_loader:
             # Move batch to device and build multi-view inputs (see dataset structure in MRAVesselMultiViewDataset)
-            inputs = {
-                "axial": batch["axial"].to(device),
-                "sagittal": batch["sagittal"].to(device),
-                "coronal": batch["coronal"].to(device),
-            }
+            if selected_model == 'MLP_tabular':
+                inputs = {
+                    "tabular": batch["tabular"].to(device),
+                }
+            elif selected_model == 'multi_CNN':
+                inputs = {
+                    "axial": batch["axial"].to(device),
+                    "sagittal": batch["sagittal"].to(device),
+                    "coronal": batch["coronal"].to(device),
+                }
+            elif selected_model == 'multimodal':
+                inputs = {
+                    "axial": batch["axial"].to(device),
+                    "sagittal": batch["sagittal"].to(device),
+                    "coronal": batch["coronal"].to(device),
+                    "tabular": batch["tabular"].to(device),
+                }
+            else:
+                raise ValueError(f"Selected model '{selected_model}' not supported.")
             labels = batch["label"].to(device)
 
             # Clear previous gradients.
@@ -222,6 +260,7 @@ def training(
             val_loader=val_loader,
             device=device,
             criterion=criterion,
+            selected_model=selected_model,
             log_images=True,
             images_per_epoch=images_per_epoch,
             step=epoch,
@@ -286,6 +325,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_dir", type=str, required=True)
     parser.add_argument("--excel_path", type=str, required=True)
+    parser.add_argument("--selected_model", type=str, required=True) # { 'MLP_tabular','multi_CNN', multimodal'}
+    parser.add_argument("--split_strategy", type=str, required=True) # {'random', 'groupwise'}
     parser.add_argument("--label_col", type=str, default="label2")
 
     parser.add_argument("--batch_size", type=int, default=2)
@@ -319,23 +360,42 @@ def main():
         name=args.wandb_run_name,
         config=vars(args),
     )
+    
+    # Load the tabular data to perform group-wise splitting
+    df = pd.read_excel(args.excel_path)
+    
+    # Extract patient IDs (without model suffix) for group-wise splitting
+    ids_all = df["file_sorgente"].astype(str).values
+    patient_ids_all = np.array([s.rsplit("_", 1)[0] for s in ids_all])
+    
+    idx_all = np.arange(len(df))
+    # Group-wise split: patients in train and val sets do not overlap
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    tr_rows, va_rows = next(gss.split(idx_all, groups=patient_ids_all))
+    
+    # Determine tabular columns (numeric columns excluding drop_cols)
+    drop_cols = {"file_sorgente", "label1", "label2"}
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    tab_cols = [c for c in numeric_cols if c not in drop_cols]
+    # Fit scaler on training tabular data
+    scaler = StandardScaler()
+    scaler.fit(df.iloc[tr_rows][tab_cols].astype(np.float32).values)
+    
     # Prepare dataset and data loaders
     dataset = MRAVesselMultiViewDataset(
         root_dir=args.root_dir,
         excel_path=args.excel_path,
         label_col=args.label_col,
+        tabular_cols=tab_cols,
+        tabular_scaler=scaler,
+        drop_cols=list(drop_cols),
     )
     
     print("Samples of dataset:", len(dataset))
-    
-    n_val = int(len(dataset) * args.val_ratio)
-    n_train = len(dataset) - n_val
-    # Split dataset into training and validation sets
-    train_ds, val_ds = random_split(
-        dataset,
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(args.seed)
-    )
+    # Select splitting strategy (random or group-wise)
+    train_ds, val_ds = select_splitting_strategy(args, dataset)
+    print("Training samples:", len(train_ds))
+    print("Validation samples:", len(val_ds))
     # Data loaders
     train_loader = DataLoader(
         train_ds,
@@ -353,13 +413,36 @@ def main():
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Model and optimizer setup
-    model = MultiViewResNet(
-        backbone_name=args.backbone,
-        pretrained=True,
-        hidden_dim=args.hidden_dim,
-    ).to(device)
+
+    if args.selected_model == 'multi_CNN':
+        # Model and optimizer setup
+        model = MultiViewResNet(
+            backbone_name=args.backbone,
+            pretrained=True,
+            hidden_dim=args.hidden_dim,
+        ).to(device)
+    elif args.selected_model == 'MLP_tabular':
+        model = MLP_tabular(
+            tabular_dim=dataset.tabular_dim,
+            tab_emb_dim=64,
+            tab_hidden=128,
+            hidden_layer=args.hidden_dim,
+            dropout_p=0.5,
+        ).to(device)
+    elif args.selected_model == 'multimodal':
+        model = MultiModalMultiViewResNet(
+            tabular_dim=dataset.tabular_dim,
+            backbone_name=args.backbone,
+            pretrained=True,
+            tab_emb_dim=64,
+            tab_hidden=128,
+            fusion_hidden=args.hidden_dim,
+            dropout_p=0.5,
+        ).to(device)
+    else:
+        print('Not supported model \n')
+        return
+
 
     optimizer = select_optimizer(args, model)
     # Start training
@@ -371,6 +454,7 @@ def main():
         lr=args.lr,
         device=device,
         num_epochs=args.epochs,
+        selected_model=args.selected_model,
         save_dir="./checkpoints_multiview",
     )
 
