@@ -260,7 +260,7 @@ def log_val_images_to_wandb(batch, probs, preds, max_items=6, step=None):
     preds_cpu = preds.detach().cpu()
     labels_cpu = batch["label"].detach().cpu()
 
-    for i in chosen_idx:
+    for i in range(k):
         # Convert each image from normalized tensor -> uint8 numpy for plotting.
         axial_u8 = denorm_to_uint8(batch["axial"][i])
         sagittal_u8 = denorm_to_uint8(batch["sagittal"][i])
