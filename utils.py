@@ -38,7 +38,47 @@ def select_optimizer(args, model):
         return None
     return optimizer
 
-def select_splitting_strategy(args, dataset):
+
+def print_patient_split(sample_ids, train_idx, val_idx):
+    '''
+    Print patient IDs in training and validation splits.
+    Parameters
+    ----------
+        sample_ids: list of str
+            List of sample IDs from the dataset.
+        train_idx: list of int
+            Indices of training samples.
+        val_idx: list of int
+            Indices of validation samples.
+    '''
+
+    train_sample_ids = [sample_ids[i] for i in train_idx[:30]]
+    val_sample_ids   = [sample_ids[i] for i in val_idx]
+
+    print("\n=== TRAIN sample_ids (first 30) ===")
+    for sid in train_sample_ids:
+        print(sid)
+
+    print("\n=== VAL sample_ids ===")
+    for sid in val_sample_ids:
+        print(sid)
+
+def select_splitting_strategy(args, dataset, print_patients=True):
+    '''
+    Select dataset splitting strategy: random or group-wise.
+    Parameters
+    ----------
+        args: argparse.Namespace
+            Must expose split_strategy, val_ratio, and seed attributes.
+        dataset: torch.utils.data.Dataset
+            Dataset to be split into training and validation sets.
+    Returns
+    -------
+        train_ds: torch.utils.data.Dataset
+            Training subset of the dataset.
+        val_ds: torch.utils.data.Dataset
+            Validation subset of the dataset.
+    '''
     
     if args.split_strategy == 'random':
         n_val = int(len(dataset) * args.val_ratio)
@@ -50,14 +90,28 @@ def select_splitting_strategy(args, dataset):
             generator=torch.Generator().manual_seed(args.seed)
         )
     elif args.split_strategy == 'group_wise':
+        # Extract patient IDs from sample IDs
         sample_ids = [s["id"] for s in dataset.samples]
+        # Get patient IDs by removing the suffix after the last underscore
         sample_patient_ids = np.array([sid.rsplit("_", 1)[0] for sid in sample_ids])
         indices = np.arange(len(dataset))
-
+        # GroupShuffleSplit to split by patient IDs
         gss2 = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        # Get train and validation indices
         train_idx, val_idx = next(gss2.split(indices, groups=sample_patient_ids))
+        
+        # Check number of unique patients in each split
+        train_groups = np.unique(sample_patient_ids[train_idx])
+        val_groups   = np.unique(sample_patient_ids[val_idx])
 
-        # check overlap
+        print(f"Num samples total: {len(indices)}")
+        print(f"Num samples train: {len(train_idx)} | val: {len(val_idx)}")
+        print(f"Num groups train: {len(train_groups)} | val: {len(val_groups)}")
+        
+        if print_patients:
+            print_patient_split(sample_ids, train_idx, val_idx)
+
+        # Check overlap
         overlap = set(sample_patient_ids[train_idx]).intersection(set(sample_patient_ids[val_idx]))
         print("Overlap patients train/val:", len(overlap))
 

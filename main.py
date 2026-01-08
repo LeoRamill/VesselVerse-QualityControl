@@ -326,7 +326,7 @@ def main():
     parser.add_argument("--root_dir", type=str, required=True)
     parser.add_argument("--excel_path", type=str, required=True)
     parser.add_argument("--selected_model", type=str, required=True) # { 'MLP_tabular','multi_CNN', multimodal'}
-    parser.add_argument("--split_strategy", type=str, required=True) # {'random', 'groupwise'}
+    parser.add_argument("--split_strategy", type=str, required=True) # {'random', 'group_wise'}
     parser.add_argument("--label_col", type=str, default="label2")
 
     parser.add_argument("--batch_size", type=int, default=2)
