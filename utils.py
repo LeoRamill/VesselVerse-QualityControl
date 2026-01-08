@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from torch.optim import SGD, Adam, RMSprop
 from sklearn.model_selection import GroupShuffleSplit
 from torch.utils.data import random_split, Subset
+import random
 
 def select_optimizer(args, model):
     """
@@ -248,16 +249,18 @@ def log_val_images_to_wandb(batch, probs, preds, max_items=6, step=None):
     step : int, optional
         Global step/epoch passed to wandb.log for consistent tracking.
     """
+    # randomly select k indices from the batch
     B = len(batch["id"])
     k = min(B, max_items)
-
+    chosen_idx = random.sample(range(B), k)
+    
     images = []
 
     probs_cpu = probs.detach().cpu()
     preds_cpu = preds.detach().cpu()
     labels_cpu = batch["label"].detach().cpu()
 
-    for i in range(k):
+    for i in chosen_idx:
         # Convert each image from normalized tensor -> uint8 numpy for plotting.
         axial_u8 = denorm_to_uint8(batch["axial"][i])
         sagittal_u8 = denorm_to_uint8(batch["sagittal"][i])
