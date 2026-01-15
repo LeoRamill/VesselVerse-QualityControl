@@ -17,6 +17,7 @@ from models.multi_modal_resnet import MultiModalMultiViewResNet
 from models.mlp import MLP_tabular
 from preprocess.mra_processing import MRAVesselMultiViewDataset
 from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb, poly_lr_scheduler, select_optimizer, select_splitting_strategy
+from sklearn.metrics import accuracy_score, roc_auc_score
 
 def get_transforms():
     """
