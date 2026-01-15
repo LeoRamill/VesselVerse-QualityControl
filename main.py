@@ -8,6 +8,7 @@ from sklearn.preprocessing import StandardScaler
 import torch
 import wandb
 import matplotlib.pyplot as plt
+from torchvision import transforms
 import torch.cuda.amp as amp
 from torch.utils.data import DataLoader, random_split,  Dataset, Subset
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
@@ -17,6 +18,190 @@ from models.mlp import MLP_tabular
 from preprocess.mra_processing import MRAVesselMultiViewDataset
 from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb, poly_lr_scheduler, select_optimizer, select_splitting_strategy
 
+def get_transforms():
+    """
+    Define data augmentations for training and validation.
+    Returns
+    -------
+    tuple
+        (train_transform, val_transform)
+    """
+    # Augmentation per il Training: Resize + Random Flip, Rotation, Affine, Color Jitter, Normalize
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(p=0.5), # Horizontal Flip with 50% probability
+        transforms.RandomRotation(degrees=10),  # Rotation
+        transforms.RandomAffine(                # Zoom and Shift
+            degrees=0, 
+            translate=(0.05, 0.05),             
+            scale=(0.95, 1.05)                  
+        ),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1), # Variations in brightness and contrast
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    # Transform for Validation: Resize + Normalize
+    val_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    
+    return train_transform, val_transform
+
+def run_test_pipeline(
+    args, 
+    checkpoint_path=None, 
+    model_instance=None, 
+    save_results=True,
+    output_csv="test_predictions.csv"
+):
+    """
+    Run the test pipeline on the provided dataset using a trained model.
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command-line arguments containing dataset and model configurations.
+    checkpoint_path : str, optional
+        Path to the trained model checkpoint. If None, `model_instance` must be provided.
+    model_instance : torch.nn.Module, optional
+        An instance of the trained model. If None, `checkpoint_path` must be provided.
+    save_results : bool, optional
+        If True, save the test predictions to a CSV file.
+    output_csv : str, optional
+        Path to the output CSV file for saving predictions.
+    Returns
+    -------
+    tuple
+        (accuracy, AUC) on the test set.
+    """
+    print("Testing Pipeline")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Prepare the test dataset
+    df = pd.read_excel(args.excel_path)
+    # Determine tabular columns
+    drop_cols = {"file_sorgente", "label1", "label2"}
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    tab_cols = [c for c in numeric_cols if c not in drop_cols]
+    
+    # Fit scaler on entire dataset's tabular data
+    ids_all = df["file_sorgente"].astype(str).values
+    patient_ids_all = np.array([s.rsplit("_", 1)[0] for s in ids_all])
+    idx_all = np.arange(len(df))
+    
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42) 
+    tr_rows, _ = next(gss.split(idx_all, groups=patient_ids_all))
+    
+    print("Fitting scaler on training tabular data...")
+    scaler = StandardScaler()
+    scaler.fit(df.iloc[tr_rows][tab_cols].astype(np.float32).values)
+    
+    # Load test dataset
+    _, val_transform = get_transforms() # No augmentation for test
+    
+    test_dataset = MRAVesselMultiViewDataset(
+        root_dir=args.root_dir,
+        excel_path=args.excel_path, 
+        label_col=args.label_col,
+        tabular_cols=tab_cols,
+        tabular_scaler=scaler,      
+        drop_cols=list(drop_cols),
+        transform=val_transform    
+    )
+    
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    print(f"Test dataset samples: {len(test_dataset)}")
+    
+    # Model loading
+    if model_instance is not None:
+        print("Using provided model instance for testing.")
+        model = model_instance
+    elif checkpoint_path is not None:
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        # Re-instantiate model based on selected type
+        if args.selected_model == 'multi_CNN':
+            model = MultiViewResNet(backbone_name=args.backbone, pretrained=False, hidden_dim=args.hidden_dim)
+        elif args.selected_model == 'MLP_tabular':
+            model = MLP_tabular(tabular_dim=test_dataset.tabular_dim, tab_emb_dim=64, tab_hidden=128, hidden_layer=args.hidden_dim)
+        elif args.selected_model == 'multimodal':
+            model = MultiModalMultiViewResNet(
+                tabular_dim=test_dataset.tabular_dim, backbone_name=args.backbone, 
+                pretrained=False, tab_emb_dim=64, tab_hidden=128, fusion_hidden=args.hidden_dim
+            )
+        
+        # Load model weights
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        raise ValueError("Either checkpoint_path or model_instance must be provided for testing.")
+
+    model.to(device)
+    model.eval()
+    
+    # Inference
+    all_preds, all_probs, all_labels, all_ids = [], [], [], []
+
+    print(f"Starting inference on test set... Total batches: {len(test_loader)}")
+    with torch.no_grad():
+        for batch in test_loader:
+            # Build model input dict based on selected model type
+            if args.selected_model == 'MLP_tabular':
+                inputs = {"tabular": batch["tabular"].to(device)}
+            elif args.selected_model == 'multi_CNN':
+                inputs = {
+                    "axial": batch["axial"].to(device),
+                    "sagittal": batch["sagittal"].to(device),
+                    "coronal": batch["coronal"].to(device),
+                }
+            elif args.selected_model == 'multimodal':
+                inputs = {
+                    "axial": batch["axial"].to(device),
+                    "sagittal": batch["sagittal"].to(device),
+                    "coronal": batch["coronal"].to(device),
+                    "tabular": batch["tabular"].to(device),
+                }
+            
+            labels = batch["label"].to(device)
+            ids = batch["id"]
+
+            # Forward
+            logits = model(inputs)
+            probs = torch.sigmoid(logits).squeeze()
+            
+            # Ensure probs is 1D
+            if probs.ndim == 0: probs = probs.unsqueeze(0)
+                
+            preds = (probs >= 0.5).float()
+
+            all_probs.extend(probs.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_ids.extend(ids)
+            
+    # Compute metrics
+    acc = accuracy_score(all_labels, all_preds)
+    try:
+        auc = roc_auc_score(all_labels, all_probs)
+    except ValueError:
+        auc = float('nan')
+        print("Warning: AUC could not be computed due to single-class predictions.")
+    
+    
+    print(f"Accuracy: {acc:.4f}")
+    print(f"AUC:      {auc:.4f}")
+
+    if save_results:
+        results_df = pd.DataFrame({
+            "patient_id": all_ids,
+            "true_label": all_labels,
+            "predicted_label": all_preds,
+            "probability": all_probs
+        })
+        results_df.to_csv(output_csv, index=False)
+
+    return acc, auc
 
 def validation(model, val_loader, device, criterion, selected_model, log_images=True, images_per_epoch=20, step=None):
     """
@@ -345,6 +530,9 @@ def main():
 
     parser.add_argument("--wandb_project", type=str, default="multiview-vessel")
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    
+    parser.add_argument("--test_excel_path", type=str, required=False)
+    
 
     args = parser.parse_args()
 
@@ -380,20 +568,64 @@ def main():
     # Fit scaler on training tabular data
     scaler = StandardScaler()
     scaler.fit(df.iloc[tr_rows][tab_cols].astype(np.float32).values)
+    # Get data transforms
+    train_transform, val_transform = get_transforms()
     
     # Prepare dataset and data loaders
-    dataset = MRAVesselMultiViewDataset(
+    train_dataset_full = MRAVesselMultiViewDataset(
         root_dir=args.root_dir,
         excel_path=args.excel_path,
         label_col=args.label_col,
         tabular_cols=tab_cols,
         tabular_scaler=scaler,
         drop_cols=list(drop_cols),
+        transform=train_transform
+    )
+
+    val_dataset_full = MRAVesselMultiViewDataset(
+        root_dir=args.root_dir,
+        excel_path=args.excel_path,
+        label_col=args.label_col,
+        tabular_cols=tab_cols,
+        tabular_scaler=scaler,
+        drop_cols=list(drop_cols),
+        transform=val_transform
     )
     
-    print("Samples of dataset:", len(dataset))
+    print("Samples of dataset (total):", len(train_dataset_full))
     # Select splitting strategy (random or group-wise)
-    train_ds, val_ds = select_splitting_strategy(args, dataset)
+    if args.split_strategy == 'group_wise':
+        # Use precomputed group-wise split
+        print("Using Group-Wise Split strategy...")
+        train_ds = Subset(train_dataset_full, tr_rows)
+        val_ds = Subset(val_dataset_full, va_rows)
+        
+        # Check overlap
+        train_pats = set(patient_ids_all[tr_rows])
+        val_pats = set(patient_ids_all[va_rows])
+        overlap = train_pats.intersection(val_pats)
+        print(f"Overlap patients train/val: {len(overlap)}")
+        
+    else:
+        # Random split
+        print("Using Random Split strategy...")
+        dataset_len = len(train_dataset_full)
+        n_val = int(dataset_len * args.val_ratio)
+        n_train = dataset_len - n_val
+
+        # Generate reproducible random indices
+        generator = torch.Generator().manual_seed(args.seed)
+        indices = torch.randperm(dataset_len, generator=generator).tolist()
+
+        # Override tr_rows/va_rows for this specific run
+        tr_rows = indices[:n_train]
+        va_rows = indices[n_train:]
+        
+        print(f"Random split created: {n_train} training samples, {n_val} validation samples")
+        
+        train_ds = Subset(train_dataset_full, tr_rows)
+        val_ds = Subset(val_dataset_full, va_rows)    
+
     print("Training samples:", len(train_ds))
     print("Validation samples:", len(val_ds))
     # Data loaders
@@ -460,7 +692,18 @@ def main():
 
     print("Best val accuracy:", best_val_acc)
     wandb.finish()
-
+    
+    if args.test_excel_path is not None:
+        # Run test pipeline on the provided test excel path
+        print("Running test pipeline...")
+        test_acc, test_auc = run_test_pipeline(
+            args=args,
+            #checkpoint_path="./checkpoints_multiview/best_model.pth",
+            model_instance=model,
+            save_results=True,
+            output_csv=args.wandb_project + "_predictions_TestSet.csv"
+        )
+        print(f"Test Accuracy: {test_acc:.4f}, Test AUC: {test_auc:.4f}")
 
 if __name__ == "__main__":
     main()
