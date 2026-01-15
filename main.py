@@ -647,34 +647,33 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.selected_model == 'multi_CNN':
-        # Model and optimizer setup
+        
         model = MultiViewResNet(
-            backbone_name=args.backbone,
-            pretrained=True,
-            hidden_dim=args.hidden_dim,
-        ).to(device)
+                backbone_name=args.backbone,
+                pretrained=True,
+                hidden_dim=args.hidden_dim,
+            ).to(device)
     elif args.selected_model == 'MLP_tabular':
         model = MLP_tabular(
-            tabular_dim=dataset.tabular_dim,
-            tab_emb_dim=64,
-            tab_hidden=128,
-            hidden_layer=args.hidden_dim,
-            dropout_p=0.5,
-        ).to(device)
+                tabular_dim=train_dataset_full.tabular_dim,
+                tab_emb_dim=64,
+                tab_hidden=128,
+                hidden_layer=args.hidden_dim,
+                dropout_p=0.5,
+            ).to(device)
     elif args.selected_model == 'multimodal':
         model = MultiModalMultiViewResNet(
-            tabular_dim=dataset.tabular_dim,
-            backbone_name=args.backbone,
-            pretrained=True,
-            tab_emb_dim=64,
-            tab_hidden=128,
-            fusion_hidden=args.hidden_dim,
-            dropout_p=0.5,
-        ).to(device)
+                tabular_dim=train_dataset_full.tabular_dim,
+                backbone_name=args.backbone,
+                pretrained=True,
+                tab_emb_dim=64,
+                tab_hidden=128,
+                fusion_hidden=args.hidden_dim,
+                dropout_p=0.5,
+            ).to(device)
     else:
         print('Not supported model \n')
         return
-
 
     optimizer = select_optimizer(args, model)
     # Start training
