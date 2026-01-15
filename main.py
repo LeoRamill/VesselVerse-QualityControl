@@ -80,7 +80,7 @@ def run_test_pipeline(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Prepare the test dataset
-    df = pd.read_excel(args.excel_path)
+    df = pd.read_excel(args.test_excel_path)
     # Determine tabular columns
     drop_cols = {"file_sorgente", "label1", "label2"}
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -102,8 +102,8 @@ def run_test_pipeline(
     _, val_transform = get_transforms() # No augmentation for test
     
     test_dataset = MRAVesselMultiViewDataset(
-        root_dir=args.root_dir,
-        excel_path=args.excel_path, 
+        root_dir=args.root_dir_test,
+        excel_path=args.test_excel_path, 
         label_col=args.label_col,
         tabular_cols=tab_cols,
         tabular_scaler=scaler,      
@@ -532,7 +532,7 @@ def main():
     parser.add_argument("--wandb_run_name", type=str, default=None)
     
     parser.add_argument("--test_excel_path", type=str, required=False)
-    
+    parser.add_argument("--root_dir_test", type=str, required=False)
 
     args = parser.parse_args()
 
