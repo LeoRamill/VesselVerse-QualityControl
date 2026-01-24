@@ -35,8 +35,11 @@ class ValidationModelWrapper(nn.Module):
         
         if self.tabular_context is not None:
             batch["tabular"] = self.tabular_context
-             
-        return self.model(batch)
+                    
+        logits = self.model(batch)
+        if logits.ndim == 1:
+            logits = logits.unsqueeze(1)
+        return logits
 
 class MultiViewGradCAM:
     def __init__(self, model, device):
@@ -79,33 +82,47 @@ class MultiViewGradCAM:
         
         # Generate heatmaps by calling GradCAM on the concatenated tensor
         # The wrapper will handle unpacking and passing to the original model
-        grayscale_cam_ax = self.cam_axial(input_tensor=input_tensor_concat, targets=targets)
-        grayscale_cam_sag = self.cam_sagittal(input_tensor=input_tensor_concat, targets=targets)
-        grayscale_cam_cor = self.cam_coronal(input_tensor=input_tensor_concat, targets=targets)
+        cam_ax = self.cam_axial(input_tensor=input_tensor_concat, targets=targets)[0, :]
+        cam_sag = self.cam_sagittal(input_tensor=input_tensor_concat, targets=targets)[0, :]
+        cam_cor = self.cam_coronal(input_tensor=input_tensor_concat, targets=targets)[0, :]
 
-        # Clear tabular context
         self.wrapper.set_tabular(None)
+        return cam_ax, cam_sag, cam_cor
 
-        return grayscale_cam_ax[0, :], grayscale_cam_sag[0, :], grayscale_cam_cor[0, :]
-
-def overlay_heatmap(original_img_tensor, cam_mask):
+def overlay_heatmap(tensor_img_norm, cam_mask):
+    """Overlay the Grad-CAM heatmap on the normalized tensor image.
+    Args:
+        tensor_img_norm: Tensor immagine normalizzata (3, H, W) float32 0-1
+        cam_mask: La maschera di attivazione (H, W) float 0-1
+    Returns:
+        visualization: Immagine sovrapposta (H, W, 3) uint8
     """
-    Overlay the CAM heatmap on the original image tensor.
-    Parameters
-    ----------
-    original_img_tensor: torch.Tensor of shape [3, H, W], values normalized as in training
-    cam_mask: numpy array of shape [H, W], values in [0, 1]
-    
-    Returns a numpy array of the overlayed image. 
-    """
-    # Denormalize the image tensor
     mean = np.array([0.485, 0.456, 0.406])
     std = np.array([0.229, 0.224, 0.225])
-    
-    img = original_img_tensor.cpu().numpy().transpose(1, 2, 0)
+    img = tensor_img_norm.cpu().detach().numpy().transpose(1, 2, 0)
     img = std * img + mean
     img = np.clip(img, 0, 1)
+    return show_cam_on_image(img, cam_mask, use_rgb=True)
+
+def overlay_heatmap_original_size(original_image_np, cam_mask):
+    """
+    Overlay the Grad-CAM heatmap on the original image size.
+    Args:
+        original_image_np: Immagine originale (H, W, 3) uint8 o float32 0-1
+        cam_mask: La maschera di attivazione (H_cam, W_cam) float 0-1
+    Returns:
+        visualization: Immagine sovrapposta (H, W, 3) uint8
+    """
+    # Normalize original image to 0-1 float
+    if original_image_np.max() > 1.0:
+        img = original_image_np.astype(np.float32) / 255.0
+    else:
+        img = original_image_np.astype(np.float32)
+
+    # Resize cam_mask to original image size
+    h_orig, w_orig = img.shape[:2]
+    cam_mask_resized = cv2.resize(cam_mask, (w_orig, h_orig))
+    # Overlay heatmap on image
+    visualization = show_cam_on_image(img, cam_mask_resized, use_rgb=True)
     
-    # Overlay the heatmap
-    visualization = show_cam_on_image(img, cam_mask, use_rgb=True)
     return visualization
