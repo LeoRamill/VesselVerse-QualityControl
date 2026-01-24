@@ -3,226 +3,31 @@ import argparse
 import random
 import numpy as np
 import pandas as pd
-import nibabel as nib # Important for NIfTI processing
-from PIL import Image
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 import torch
 import wandb
-import cv2 
+import matplotlib.pyplot as plt
 from torchvision import transforms
 import torchvision 
-from torch.utils.data import DataLoader, Dataset, Subset
-from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve
+import cv2 
+import torch.cuda.amp as amp
+from torch.utils.data import DataLoader, random_split,  Dataset, Subset
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, accuracy_score
 
-# Custom imports (Assuming these modules exist in your project structure)
+# Import dei modelli e utils originali
 from models.multi_resnet import MultiViewResNet
 from models.multi_modal_resnet import MultiModalMultiViewResNet
 from models.mlp import MLP_tabular
 from preprocess.mra_processing import MRAVesselMultiViewDataset
-from utils import poly_lr_scheduler, select_optimizer
+from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb, poly_lr_scheduler, select_optimizer, select_splitting_strategy
+
+# --- IMPORT PER XAI ---
 from utils_xai import MultiViewGradCAM, overlay_heatmap
 
-try:
-    import VESSEL_METRICS 
-except ImportError:
-    print("WARNING: VESSEL_METRICS.py not found. Tabular feature extraction for single NIfTI will fail.")
-    VESSEL_METRICS = None
-
-def generate_mips_from_nifti(nifti_path):
-    """
-    Load a 3D NIfTI file and generate 3 Maximum Intensity Projections (MIPs):
-    Axial, Sagittal, and Coronal, maintaining original resolution.
-    Returns a dictionary of numpy uint8 arrays (H, W, 3).
-    """
-    img_obj = nib.load(nifti_path)
-    data = img_obj.get_fdata()
-    
-    # Standard medical orientation: usually (Sagittal, Coronal, Axial) in array dimensions
-    # However, it depends on the NIfTI header. We assume standard (X, Y, Z).
-    # Axial: Projection onto Z (axis 2)
-    # Sagittal: Projection onto X (axis 0)
-    # Coronal: Projection onto Y (axis 1)
-    
-    mip_ax = np.max(data, axis=2)
-    mip_sag = np.max(data, axis=0)
-    mip_cor = np.max(data, axis=1)
-
-    # Rotations for correct visualization (Empirical, varies by scanner/preprocessing)
-    mip_ax = np.rot90(mip_ax)
-    mip_sag = np.rot90(mip_sag)
-    mip_cor = np.rot90(mip_cor)
-
-    def to_uint8_rgb(mip):
-        # Normalize min-max to 0-255
-        mip = mip - mip.min()
-        if mip.max() > 0:
-            mip = (mip / mip.max()) * 255
-        mip = mip.astype(np.uint8)
-        # Stack to create RGB channels
-        return np.stack([mip, mip, mip], axis=-1)
-
-    return {
-        "axial": to_uint8_rgb(mip_ax),
-        "sagittal": to_uint8_rgb(mip_sag),
-        "coronal": to_uint8_rgb(mip_cor)
-    }
-
-def extract_features_from_nifti(nifti_path, feature_names_ordered):
-    """
-    Uses VESSEL_METRICS.process to calculate metrics on the fly.
-    Returns an ordered numpy array matching the model's input expectation.
-    """
-    if VESSEL_METRICS is None:
-        raise ImportError("VESSEL_METRICS module is missing. Cannot extract features.")
-
-    # Define which metrics to compute (Should cover those used during training)
-    metrics_to_compute = [
-        'total_length', 'num_bifurcations', 'bifurcation_density', 'volume',
-        'fractal_dimension', 'lacunarity', 'num_loops', 
-        'num_abnormal_degree_nodes', 'mean_loop_length', 'max_loop_length',
-        'avg_diameter'
-    ]
-    
-    # Call VESSEL_METRICS processing
-    # Note: process returns a dict {component_id: {data...}}
-    results = VESSEL_METRICS.process(
-        nifti_path, 
-        selected_metrics=set(metrics_to_compute), 
-        save_conn_comp_masks=False, 
-        save_seg_masks=False
-    )
-    
-    # Simple Aggregation (Sum for additive metrics, Weighted Mean for others)
-    # We initialize with 0.0
-    agg_data = {k: 0.0 for k in feature_names_ordered}
-    
-    total_len_all = 0.0
-    
-    for cid, data in results.items():
-        # Example aggregation logic
-        if 'total_length' in data:
-            total_len_all += data['total_length']
-        
-        # Direct sums
-        for key in ['total_length', 'num_bifurcations', 'volume', 'num_loops', 'num_abnormal_degree_nodes']:
-             if key in agg_data and key in data:
-                 agg_data[key] += data[key]
-                 
-    # Note: For complex features (like Lacunarity), you should implement the exact 
-    # aggregation logic used in your training preprocessing script.
-    
-    # Construct ordered feature vector
-    feature_vector = []
-    for name in feature_names_ordered:
-        val = agg_data.get(name, 0.0)
-        feature_vector.append(val)
-        
-    return np.array(feature_vector, dtype=np.float32)
-
-def predict_single_nifti(args, nifti_path, model, device, scaler, feature_cols, gt_label=None):
-    """
-    Standalone function to predict on a new single case.
-    Generates prediction, probabilities, and a GradCAM visualization montage.
-    """
-    print(f"\n--- Processing Single Case: {nifti_path} ---")
-    
-    # 1. Generate Original MIP Images
-    mips_orig = generate_mips_from_nifti(nifti_path) # Dict of numpy arrays (H, W, 3)
-    
-    # 2. Preprocess Images for Model (Resize -> Tensor -> Norm)
-    _, val_transform = get_transforms()
-    
-    inputs_tensor = {}
-    for view in ['axial', 'sagittal', 'coronal']:
-        # Convert numpy to PIL for transforms
-        img_pil = Image.fromarray(mips_orig[view])
-        # Apply transforms (Resize 224x224, Norm) and add batch dimension
-        img_tensor = val_transform(img_pil).unsqueeze(0).to(device) 
-        inputs_tensor[view] = img_tensor
-
-    # 3. Tabular Extraction and Preprocessing
-    # Only needed if model is Multimodal or MLP
-    if args.selected_model in ['multimodal', 'MLP_tabular']:
-        print("Extracting tabular features...")
-        raw_feats = extract_features_from_nifti(nifti_path, feature_cols)
-        # Scale features using the scaler fitted on training data
-        feats_scaled = scaler.transform(raw_feats.reshape(1, -1))
-        inputs_tensor['tabular'] = torch.tensor(feats_scaled, dtype=torch.float32).to(device)
-
-    # 4. Prediction
-    model.eval()
-    
-    # Initialize GradCAM
-    grad_cam = MultiViewGradCAM(model, device)
-    
-    cam_ax, cam_sag, cam_cor = None, None, None
-
-    # Enable gradients for GradCAM calculation
-    with torch.enable_grad():
-        # Requires_grad must be set on input tensors
-        for k, v in inputs_tensor.items():
-            if isinstance(v, torch.Tensor) and v.dtype == torch.float:
-                v.requires_grad = True
-
-        logits = model(inputs_tensor)
-        prob = torch.sigmoid(logits).item()
-        pred = 1 if prob >= 0.5 else 0
-        
-        # 5. Generate Grad-CAM (224x224 maps)
-        # target_category=None uses the predicted class
-        if args.selected_model in ['multi_CNN', 'multimodal']:
-             cam_ax, cam_sag, cam_cor = grad_cam.generate_maps(inputs_tensor)
-
-    # 6. Visualization
-    # Overlay heatmap on original sized images (requires resizing map to original img size)
-    # Note: overlay_heatmap usually handles resizing internally if implemented robustly,
-    # otherwise we resize the CAM to match mips_orig.
-    
-    # Helper to resize and overlay
-    def apply_overlay(orig_img, cam_map):
-        if cam_map is None: return orig_img
-        # Resize cam to orig size
-        cam_resized = cv2.resize(cam_map, (orig_img.shape[1], orig_img.shape[0]))
-        # Use existing utility or cv2 directly
-        return overlay_heatmap(orig_img, cam_resized, alpha=0.5) 
-
-    viz_ax = apply_overlay(mips_orig['axial'], cam_ax)
-    viz_sag = apply_overlay(mips_orig['sagittal'], cam_sag)
-    viz_cor = apply_overlay(mips_orig['coronal'], cam_cor)
-
-    # 7. Create Horizontal Montage (handling different heights with padding)
-    h_max = max(viz_ax.shape[0], viz_sag.shape[0], viz_cor.shape[0])
-    
-    def pad_img(img, target_h):
-        if img.shape[0] == target_h: return img
-        # Pad with black at the bottom
-        pad = np.zeros((target_h - img.shape[0], img.shape[1], 3), dtype=np.uint8)
-        return np.vstack([img, pad])
-
-    viz_ax = pad_img(viz_ax, h_max)
-    viz_sag = pad_img(viz_sag, h_max)
-    viz_cor = pad_img(viz_cor, h_max)
-    
-    # White borders for separation
-    border = np.ones((h_max, 10, 3), dtype=np.uint8) * 255
-    montage = np.hstack([viz_ax, border, viz_sag, border, viz_cor])
-
-    # 8. Add Text Info
-    montage_bgr = cv2.cvtColor(montage, cv2.COLOR_RGB2BGR)
-    label_text = f"Pred: {pred} | Prob: {prob:.4f}"
-    if gt_label is not None:
-        label_text += f" | GT: {gt_label}"
-    
-    color = (0, 255, 0) if (gt_label is None or pred == gt_label) else (0, 0, 255)
-    cv2.putText(montage_bgr, label_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-    
-    # Save Result
-    output_filename = f"SinglePrediction_{os.path.basename(nifti_path)}.jpg"
-    cv2.imwrite(output_filename, montage_bgr)
-    print(f"Prediction: {pred} (Prob: {prob:.4f}). Result saved to {output_filename}")
-    
-    return pred, prob, montage_bgr
+# Costanti di normalizzazione (ImageNet)
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 def get_transforms():
     """
@@ -235,104 +40,306 @@ def get_transforms():
         transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
         transforms.ColorJitter(brightness=0.1, contrast=0.1), 
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
     val_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
     
     return train_transform, val_transform
 
-def run_test_pipeline(args, checkpoint_path=None, model_instance=None, save_results=True, output_csv="test_predictions.csv"):
+def denormalize(tensor):
     """
-    Run the test pipeline on the provided dataset using a trained model.
+    Inverte la normalizzazione ImageNet per la visualizzazione.
+    Input: Tensor (C, H, W) normalizzato.
+    Output: Numpy Array (H, W, C) in range [0, 255] uint8.
+    """
+    # Clone per non modificare il tensore originale usato per i gradienti
+    t = tensor.clone().detach().cpu()
+    
+    # Inverti normalizzazione: pixel = (pixel * std) + mean
+    for t_c, m, s in zip(t, IMAGENET_MEAN, IMAGENET_STD):
+        t_c.mul_(s).add_(m)
+    
+    # Clamping per sicurezza (evita valori <0 o >1 dovuti a arrotondamenti)
+    t = torch.clamp(t, 0, 1)
+    
+    # Converti a numpy (H, W, C) e poi a uint8
+    img_np = t.permute(1, 2, 0).numpy()
+    img_np = (img_np * 255).astype(np.uint8)
+    return img_np
+
+def run_test_pipeline(
+    args, 
+    checkpoint_path=None, 
+    model_instance=None, 
+    save_results=True,
+    output_csv="test_predictions.csv",
+    log_images_to_wandb=True
+):
+    """
+    Run the test pipeline and log ALL results to a WandB Table.
     """
     print("Testing Pipeline")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load test data and configure scaler (requires fitting on training data first in a real scenario,
-    # or loading a saved scaler. Here we approximate by fitting on test data or assuming passed scaler logic).
-    # For brevity, reusing the loading logic similar to main or validation.
+    # 1. Preparazione Dati Test
+    df = pd.read_excel(args.test_excel_path)
+    drop_cols = {"file_sorgente", "label1", "label2"}
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    tab_cols = [c for c in numeric_cols if c not in drop_cols]
     
-    # NOTE: In a strictly correct pipeline, you should load the scaler saved during training.
-    # Here, we assume the dataset class handles scaling if passed, or we refit.
-    # To avoid complexity, we assume model_instance is ready and we just load data.
+    ids_all = df["file_sorgente"].astype(str).values
+    patient_ids_all = np.array([s.rsplit("_", 1)[0] for s in ids_all])
+    idx_all = np.arange(len(df))
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42) 
+    tr_rows, _ = next(gss.split(idx_all, groups=patient_ids_all))
     
-    # Implementation of test loading omitted for brevity, assuming standard DataLoader
-    # ...
-    # Placeholder return
-    return 0.0, 0.0
+    print("Fitting scaler on available tabular data...")
+    scaler = StandardScaler()
+    scaler.fit(df.iloc[tr_rows][tab_cols].astype(np.float32).values)
+    
+    _, val_transform = get_transforms()
+    
+    test_dataset = MRAVesselMultiViewDataset(
+        root_dir=args.root_dir_test,
+        excel_path=args.test_excel_path, 
+        label_col=args.label_col,
+        tabular_cols=tab_cols,
+        tabular_scaler=scaler,      
+        drop_cols=list(drop_cols),
+        transform=val_transform    
+    )
+    
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    print(f"Test dataset samples: {len(test_dataset)}")
+    
+    # 2. Caricamento Modello
+    if model_instance is not None:
+        model = model_instance
+    elif checkpoint_path is not None:
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        if args.selected_model == 'multi_CNN':
+            model = MultiViewResNet(backbone_name=args.backbone, pretrained=False, hidden_dim=args.hidden_dim)
+        elif args.selected_model == 'MLP_tabular':
+            model = MLP_tabular(tabular_dim=test_dataset.tabular_dim, tab_emb_dim=64, tab_hidden=128, hidden_layer=args.hidden_dim)
+        elif args.selected_model == 'multimodal':
+            model = MultiModalMultiViewResNet(
+                tabular_dim=test_dataset.tabular_dim, backbone_name=args.backbone, 
+                pretrained=False, tab_emb_dim=64, tab_hidden=128, fusion_hidden=args.hidden_dim
+            )
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        raise ValueError("Either checkpoint_path or model_instance must be provided.")
+
+    model.to(device)
+    model.eval()
+    
+    # 3. Setup WandB Table e GradCAM
+    wandb_table = None
+    grad_cam = None
+    
+    if log_images_to_wandb and args.selected_model in ['multi_CNN', 'multimodal']:
+        print("Initializing WandB Table and GradCAM for full test set logging...")
+        wandb_table = wandb.Table(columns=["Patient ID", "Grad-CAM Visualization", "Ground Truth", "Prediction", "Probability"])
+        try:
+            grad_cam = MultiViewGradCAM(model, device)
+        except Exception as e:
+            print(f"Could not initialize GradCAM: {e}")
+            log_images_to_wandb = False
+
+    all_preds, all_probs, all_labels, all_ids = [], [], [], []
+
+    print(f"Starting inference... Total batches: {len(test_loader)}")
+    
+    for batch_idx, batch in enumerate(test_loader):
+        context_manager = torch.enable_grad() if (log_images_to_wandb and grad_cam) else torch.no_grad()
+        
+        with context_manager:
+            if args.selected_model == 'MLP_tabular':
+                inputs = {"tabular": batch["tabular"].to(device)}
+            elif args.selected_model == 'multi_CNN':
+                inputs = {
+                    "axial": batch["axial"].to(device),
+                    "sagittal": batch["sagittal"].to(device),
+                    "coronal": batch["coronal"].to(device),
+                }
+            elif args.selected_model == 'multimodal':
+                inputs = {
+                    "axial": batch["axial"].to(device),
+                    "sagittal": batch["sagittal"].to(device),
+                    "coronal": batch["coronal"].to(device),
+                    "tabular": batch["tabular"].to(device),
+                }
+            
+            if log_images_to_wandb and grad_cam:
+                 for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor) and v.dtype == torch.float:
+                        v.requires_grad = True
+
+            labels = batch["label"].to(device)
+            ids = batch["id"]
+
+            logits = model(inputs)
+            probs = torch.sigmoid(logits).squeeze()
+            if probs.ndim == 0: probs = probs.unsqueeze(0)
+            preds = (probs >= 0.5).float()
+
+            all_probs.extend(probs.detach().cpu().numpy())
+            all_preds.extend(preds.detach().cpu().numpy())
+            all_labels.extend(labels.detach().cpu().numpy())
+            all_ids.extend(ids)
+
+            # --- LOGGING WANDB CON DENORMALIZZAZIONE ---
+            if log_images_to_wandb and grad_cam:
+                batch_size_curr = len(ids)
+                for i in range(batch_size_curr):
+                    try:
+                        single_input = {k: v[i].unsqueeze(0) for k, v in inputs.items()}
+                        
+                        # Genera mappe di attivazione
+                        cam_ax, cam_sag, cam_cor = grad_cam.generate_maps(single_input)
+                        
+                        # --- MODIFICA CHIAVE: Denormalizza le immagini prima dell'overlay ---
+                        img_ax_vis = denormalize(inputs['axial'][i])
+                        img_sag_vis = denormalize(inputs['sagittal'][i])
+                        img_cor_vis = denormalize(inputs['coronal'][i])
+
+                        # Overlay (passiamo immagini denormalizzate in 0-255)
+                        viz_ax = overlay_heatmap(img_ax_vis, cam_ax)
+                        viz_sag = overlay_heatmap(img_sag_vis, cam_sag)
+                        viz_cor = overlay_heatmap(img_cor_vis, cam_cor)
+                        
+                        border = np.ones((viz_ax.shape[0], 5, 3), dtype=np.uint8) * 255
+                        montage = np.hstack([viz_ax, border, viz_sag, border, viz_cor])
+                        
+                        wandb_table.add_data(
+                            str(ids[i]),
+                            wandb.Image(montage),
+                            int(labels[i].item()),
+                            int(preds[i].item()),
+                            probs[i].item()
+                        )
+                    except Exception as e:
+                        print(f"Error logging image for {ids[i]}: {e}")
+
+    acc = accuracy_score(all_labels, all_preds)
+    try:
+        auc = roc_auc_score(all_labels, all_probs)
+    except ValueError:
+        auc = float('nan')
+    
+    print(f"Test Accuracy: {acc:.4f}")
+    print(f"Test AUC:      {auc:.4f}")
+
+    if save_results:
+        results_df = pd.DataFrame({
+            "patient_id": all_ids,
+            "true_label": all_labels,
+            "predicted_label": all_preds,
+            "probability": all_probs
+        })
+        results_df.to_csv(output_csv, index=False)
+        
+    if wandb_table is not None:
+        print("Uploading Test Set Table to WandB...")
+        wandb.log({"Test Set Analysis": wandb_table})
+
+    return acc, auc
 
 def validation(model, val_loader, device, criterion, selected_model, log_images=True, images_per_epoch=20, step=None):
     """
-    Run validation for one epoch.
+    Validation loop with partial Grad-CAM logging (Denormalized).
     """
+    print('Starting Validation')
     model.eval()
     losses, y_true, y_pred, y_prob = [], [], [], []
     wandb_images = []
-    
-    # Initialize GradCAM if needed
+
     grad_cam_engine = None
     if log_images and selected_model in ['multi_CNN', 'multimodal']:
         try:
             grad_cam_engine = MultiViewGradCAM(model, device)
         except Exception as e:
-            print(f"Warning: Could not initialize GradCAM: {e}") 
+            print(f"Warning: Could not initialize GradCAM: {e}")
 
     for batch_idx, batch in enumerate(val_loader):
         is_viz_batch = (batch_idx == 0) and log_images
         context_manager = torch.enable_grad() if (is_viz_batch and grad_cam_engine) else torch.no_grad()
-        
+
         with context_manager:
             if selected_model == 'MLP_tabular':
                 inputs = {"tabular": batch["tabular"].to(device)}
             elif selected_model == 'multi_CNN':
-                inputs = {k: batch[k].to(device) for k in ["axial", "sagittal", "coronal"]}
+                inputs = {"axial": batch["axial"].to(device), "sagittal": batch["sagittal"].to(device), "coronal": batch["coronal"].to(device)}
             elif selected_model == 'multimodal':
-                inputs = {k: batch[k].to(device) for k in ["axial", "sagittal", "coronal", "tabular"]}
+                inputs = {"axial": batch["axial"].to(device), "sagittal": batch["sagittal"].to(device), "coronal": batch["coronal"].to(device), "tabular": batch["tabular"].to(device)}
             
             labels = batch["label"].to(device)
-            
+
             if is_viz_batch and grad_cam_engine:
                  for k, v in inputs.items():
-                    if isinstance(v, torch.Tensor) and v.dtype == torch.float:
-                        v.requires_grad = True
+                    if isinstance(v, torch.Tensor) and v.dtype == torch.float: v.requires_grad = True
 
             logits = model(inputs)
             loss = criterion(logits, labels)
             probs = torch.sigmoid(logits)
             preds = (probs >= 0.5).float()
-            
+
             if is_viz_batch and grad_cam_engine:
-                # Visualization logic (simplified)
-                pass
+                num_imgs = min(len(labels), images_per_epoch)
+                try:
+                    for i in range(num_imgs):
+                        single_input = {k: v[i].unsqueeze(0) for k, v in inputs.items()}
+                        cam_ax, cam_sag, cam_cor = grad_cam_engine.generate_maps(single_input)
+                        
+                        # --- MODIFICA CHIAVE: Denormalizza le immagini prima dell'overlay ---
+                        img_ax_vis = denormalize(inputs['axial'][i])
+                        img_sag_vis = denormalize(inputs['sagittal'][i])
+                        img_cor_vis = denormalize(inputs['coronal'][i])
+
+                        viz_ax = overlay_heatmap(img_ax_vis, cam_ax)
+                        viz_sag = overlay_heatmap(img_sag_vis, cam_sag)
+                        viz_cor = overlay_heatmap(img_cor_vis, cam_cor)
+                        
+                        montage = np.hstack([viz_ax, viz_sag, viz_cor])
+                        caption = f"ID: {batch['id'][i]} | GT: {int(labels[i].item())} | Pred: {int(preds[i].item())}"
+                        wandb_images.append(wandb.Image(montage, caption=caption))
+                except Exception as e:
+                    print(f"Error val GradCAM: {e}")
 
             losses.append(loss.item())
             y_true.append(labels.detach().cpu())
             y_pred.append(preds.detach().cpu())
             y_prob.append(probs.detach().cpu())
 
-    y_true = torch.cat(y_true).numpy()
-    y_pred = torch.cat(y_pred).numpy()
+    y_true = torch.cat(y_true).numpy().astype(int)
+    y_pred = torch.cat(y_pred).numpy().astype(int)
     y_prob = torch.cat(y_prob).numpy()
-    
-    val_loss = float(np.mean(losses))
-    val_acc = accuracy_score(y_true, y_pred)
-    try:
-        val_auc = roc_auc_score(y_true, y_prob)
-        fpr, tpr, _ = roc_curve(y_true, y_prob)
-    except:
-        val_auc = float('nan')
-        fpr, tpr = None, None
+    val_loss = float(np.mean(losses)) if len(losses) else 0.0
+    val_acc = float((y_pred == y_true).mean()) if len(y_true) else 0.0
+
+    if len(np.unique(y_true)) == 2:
+        try:
+            val_auc = float(roc_auc_score(y_true, y_prob))
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+        except ValueError:
+            val_auc, fpr, tpr = float("nan"), None, None
+    else:
+        val_auc, fpr, tpr = float("nan"), None, None
+
+    if log_images and len(wandb_images) > 0:
+        wandb.log({"val_gradcam_analysis": wandb_images}, step=step)
 
     return val_loss, val_acc, val_auc, (fpr, tpr), y_true, y_pred, y_prob
 
 def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs, save_dir="./checkpoints", use_amp=True, images_per_epoch=20, selected_model='multimodal'):
     """
-    Main training loop.
+    Standard training loop.
     """
     os.makedirs(save_dir, exist_ok=True)
     criterion = torch.nn.BCEWithLogitsLoss()
@@ -342,7 +349,7 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
 
     for epoch in range(1, num_epochs + 1):
         poly_lr_scheduler(optimizer, lr, epoch)
-        print(f'Starting Training Epoch {epoch}')
+        print('Starting Training Epoch', epoch)
         model.train()
         train_losses = []
 
@@ -350,182 +357,158 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
             if selected_model == 'MLP_tabular':
                 inputs = {"tabular": batch["tabular"].to(device)}
             elif selected_model == 'multi_CNN':
-                inputs = {k: batch[k].to(device) for k in ["axial", "sagittal", "coronal"]}
+                inputs = {"axial": batch["axial"].to(device), "sagittal": batch["sagittal"].to(device), "coronal": batch["coronal"].to(device)}
             elif selected_model == 'multimodal':
-                 inputs = {k: batch[k].to(device) for k in ["axial", "sagittal", "coronal", "tabular"]}
-            
+                inputs = {"axial": batch["axial"].to(device), "sagittal": batch["sagittal"].to(device), "coronal": batch["coronal"].to(device), "tabular": batch["tabular"].to(device)}
             labels = batch["label"].to(device)
 
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 logits = model(inputs)
                 loss = criterion(logits, labels)
-            
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             train_losses.append(loss.item())
+
+        train_loss = float(np.mean(train_losses)) if len(train_losses) else 0.0
         
-        train_loss = float(np.mean(train_losses))
-        
-        # Validation
         val_loss, val_acc, val_auc, (fpr, tpr), y_true, y_pred, y_prob = validation(
-            model, val_loader, device, criterion, selected_model, log_images=True, step=epoch
+            model=model, val_loader=val_loader, device=device, criterion=criterion, 
+            selected_model=selected_model, log_images=True, images_per_epoch=images_per_epoch, step=epoch
         )
 
-        print(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Val Acc: {val_acc:.4f} | Val AUC: {val_auc:.4f}")
-        
-        wandb.log({"epoch": epoch, "train_loss": train_loss, "val_acc": val_acc, "val_auc": val_auc})
+        log_dict = {"epoch": epoch, "train/loss": train_loss, "val/loss": val_loss, "val/accuracy": val_acc, "val/auc": val_auc}
+        wandb.log(log_dict, step=epoch)
+
+        print(f"Epoch [{epoch:03d}/{num_epochs}] | train_loss={train_loss:.4f} | val_acc={val_acc:.4f} | val_auc={val_auc:.4f}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_val_acc": best_val_acc,
-            }, os.path.join(save_dir, "best_model.pth"))
-            print(f"Saved best model (Acc: {best_val_acc:.4f})")
+            ckpt_path = os.path.join(save_dir, "best_model.pth")
+            torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "best_val_acc": best_val_acc}, ckpt_path)
+            wandb.run.summary["best_val_acc"] = best_val_acc
+            print(f" Saved best model (val_acc={best_val_acc:.4f})")
 
     return best_val_acc
 
 def main():
     parser = argparse.ArgumentParser()
-    # Required Arguments
-    parser.add_argument("--root_dir", type=str, required=True, help="Root directory of dataset")
-    parser.add_argument("--excel_path", type=str, required=True, help="Path to excel file with labels/features")
-    parser.add_argument("--selected_model", type=str, required=True) # { 'MLP_tabular','multi_CNN', 'multimodal'}
-    parser.add_argument("--split_strategy", type=str, required=True) # {'random', 'group_wise'}
-    
-    # Training Hyperparameters
+    parser.add_argument("--root_dir", type=str, required=True)
+    parser.add_argument("--excel_path", type=str, required=True)
+    parser.add_argument("--selected_model", type=str, required=True)
+    parser.add_argument("--split_strategy", type=str, required=True) 
+    parser.add_argument("--label_col", type=str, default="label2")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--optimizer", type=str, default='sgd')
     parser.add_argument("--lr", type=float, default=2.5e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backbone", type=str, default="resnet18")
     parser.add_argument("--hidden_dim", type=int, default=256)
-
-    # WandB
     parser.add_argument("--wandb_project", type=str, default="multiview-vessel")
     parser.add_argument("--wandb_run_name", type=str, default=None)
-    
-    # Optional Test Set Arguments
     parser.add_argument("--test_excel_path", type=str, required=False)
     parser.add_argument("--root_dir_test", type=str, required=False)
-    
-    # NEW ARGUMENT FOR SINGLE NIFTI PREDICTION
-    parser.add_argument("--single_nifti_path", type=str, default=None, help="Path to a single .nii.gz for one-shot prediction")
-    parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to model checkpoint (optional, loads best_model by default if training)")
 
     args = parser.parse_args()
 
-    # Set seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(args.seed)
 
     wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
     
-    # 1. Load Data to determine Tabular Columns and Fit Scaler
-    # (Essential even for single inference to ensure consistent scaling)
+    # Load Training Data
     df = pd.read_excel(args.excel_path)
-    
-    # Extract patient IDs for splitting
     ids_all = df["file_sorgente"].astype(str).values
     patient_ids_all = np.array([s.rsplit("_", 1)[0] for s in ids_all])
     idx_all = np.arange(len(df))
-    
-    # Perform GroupWise split to find training set indices
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
     tr_rows, va_rows = next(gss.split(idx_all, groups=patient_ids_all))
     
-    # Identify numeric columns
     drop_cols = {"file_sorgente", "label1", "label2"}
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     tab_cols = [c for c in numeric_cols if c not in drop_cols]
     
-    # Fit Scaler on Training Data Only
-    print("Fitting scaler on training data...")
     scaler = StandardScaler()
     scaler.fit(df.iloc[tr_rows][tab_cols].astype(np.float32).values)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 2. Initialize Model
-    print(f"Initializing model: {args.selected_model}")
-    if args.selected_model == 'multi_CNN':
-        model = MultiViewResNet(backbone_name=args.backbone, pretrained=True, hidden_dim=args.hidden_dim).to(device)
-    elif args.selected_model == 'MLP_tabular':
-        model = MLP_tabular(tabular_dim=len(tab_cols), tab_emb_dim=64, tab_hidden=128, hidden_layer=args.hidden_dim).to(device)
-    elif args.selected_model == 'multimodal':
-        model = MultiModalMultiViewResNet(
-            tabular_dim=len(tab_cols), backbone_name=args.backbone, pretrained=True, 
-            tab_emb_dim=64, tab_hidden=128, fusion_hidden=args.hidden_dim
-        ).to(device)
-    else:
-        raise ValueError("Unknown model type")
-
-    # 3. BRANCH: Single NIfTI Prediction
-    if args.single_nifti_path is not None:
-        if args.checkpoint_path and os.path.exists(args.checkpoint_path):
-            print(f"Loading checkpoint from {args.checkpoint_path}")
-            checkpoint = torch.load(args.checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            print("WARNING: No checkpoint provided for single inference. Using random/pretrained weights (or weights after training if you implemented that flow).")
-
-        if os.path.exists(args.single_nifti_path):
-            predict_single_nifti(
-                args=args,
-                nifti_path=args.single_nifti_path,
-                model=model,
-                device=device,
-                scaler=scaler,
-                feature_cols=tab_cols,
-                gt_label=None # You can pass ground truth if known
-            )
-        else:
-            print(f"File not found: {args.single_nifti_path}")
-            
-        # Exit after single prediction
-        return 
-
-    # 4. Standard Training Pipeline (if not single inference)
+    
     train_transform, val_transform = get_transforms()
     
-    # Create Datasets
     train_dataset_full = MRAVesselMultiViewDataset(
-        root_dir=args.root_dir, excel_path=args.excel_path, label_col=args.label_col,
-        tabular_cols=tab_cols, tabular_scaler=scaler, drop_cols=list(drop_cols), transform=train_transform
-    )
-    val_dataset_full = MRAVesselMultiViewDataset(
-        root_dir=args.root_dir, excel_path=args.excel_path, label_col=args.label_col,
-        tabular_cols=tab_cols, tabular_scaler=scaler, drop_cols=list(drop_cols), transform=val_transform
+        root_dir=args.root_dir,
+        excel_path=args.excel_path,
+        label_col=args.label_col,
+        tabular_cols=tab_cols,
+        tabular_scaler=scaler,
+        drop_cols=list(drop_cols),
+        transform=train_transform
     )
 
-    # Subsetting based on pre-calculated indices (tr_rows, va_rows)
-    train_ds = Subset(train_dataset_full, tr_rows)
-    val_ds = Subset(val_dataset_full, va_rows)
+    val_dataset_full = MRAVesselMultiViewDataset(
+        root_dir=args.root_dir,
+        excel_path=args.excel_path,
+        label_col=args.label_col,
+        tabular_cols=tab_cols,
+        tabular_scaler=scaler,
+        drop_cols=list(drop_cols),
+        transform=val_transform
+    )
+    
+    if args.split_strategy == 'group_wise':
+        train_ds = Subset(train_dataset_full, tr_rows)
+        val_ds = Subset(val_dataset_full, va_rows)
+    else:
+        dataset_len = len(train_dataset_full)
+        n_val = int(dataset_len * args.val_ratio)
+        n_train = dataset_len - n_val
+        generator = torch.Generator().manual_seed(args.seed)
+        indices = torch.randperm(dataset_len, generator=generator).tolist()
+        train_ds = Subset(train_dataset_full, indices[:n_train])
+        val_ds = Subset(val_dataset_full, indices[n_train:])    
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Model Init
+    if args.selected_model == 'multi_CNN':
+        model = MultiViewResNet(args.backbone, pretrained=True, hidden_dim=args.hidden_dim).to(device)
+    elif args.selected_model == 'MLP_tabular':
+        model = MLP_tabular(train_dataset_full.tabular_dim, 64, 128, args.hidden_dim, 0.5).to(device)
+    elif args.selected_model == 'multimodal':
+        model = MultiModalMultiViewResNet(train_dataset_full.tabular_dim, args.backbone, True, 64, 128, args.hidden_dim, 0.5).to(device)
+    else:
+        print('Not supported model'); return
+
     optimizer = select_optimizer(args, model)
-
-    # Run Training
-    best_val_acc = training(
-        model=model, train_loader=train_loader, val_loader=val_loader, optimizer=optimizer,
-        lr=args.lr, device=device, num_epochs=args.epochs, selected_model=args.selected_model,
-        save_dir="./checkpoints_multiview"
-    )
-
-    print(f"Training Complete. Best Validation Accuracy: {best_val_acc}")
+    
+    # Training
+    best_val_acc = training(model, train_loader, val_loader, optimizer, args.lr, device, args.epochs, "./checkpoints_multiview", selected_model=args.selected_model)
+    print("Best val accuracy:", best_val_acc)
     wandb.finish()
+    
+    # Test
+    if args.test_excel_path is not None:
+        test_run_name = args.wandb_run_name + "_TEST" if args.wandb_run_name else None
+        wandb.init(project=args.wandb_project, name=test_run_name, config=vars(args))
+        print("Running test pipeline...")
+        test_acc, test_auc = run_test_pipeline(
+            args=args,
+            model_instance=model, 
+            save_results=True,
+            output_csv=args.wandb_project + "_predictions_TestSet.csv",
+            log_images_to_wandb=True 
+        )
+        wandb.finish()
 
 if __name__ == "__main__":
     main()
