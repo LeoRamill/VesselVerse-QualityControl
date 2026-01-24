@@ -19,6 +19,9 @@ from preprocess.mra_processing import MRAVesselMultiViewDataset
 from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb, poly_lr_scheduler, select_optimizer, select_splitting_strategy
 from sklearn.metrics import accuracy_score, roc_auc_score
 
+from utils_xai import MultiViewGradCAM, overlay_heatmap
+import cv2
+
 def get_transforms():
     """
     Define data augmentations for training and validation.
@@ -252,15 +255,29 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
     first_batch_for_images = None
     first_batch_probs = None
     first_batch_preds = None
-
-
-    with torch.no_grad():
-        for batch in val_loader:
-            # Build the model input dict for multi-view inference.
+    
+    wandb_images = []
+    
+    # Initialize GradCAM engine if logging images
+    grad_cam_engine = None
+    if log_images and selected_model in ['multi_CNN', 'multimodal']:
+        try:
+            grad_cam_engine = MultiViewGradCAM(model, device)
+        except Exception as e:
+            print(f"Warning: Could not initialize GradCAM: {e}")     
+    
+    # Validation loop
+    for batch_idx, batch in enumerate(val_loader):
+        # Determine if this is the batch to visualize
+        is_viz_batch = (batch_idx == 0) and log_images
+        
+        # Set up context manager for gradient tracking if visualizing
+        context_manager = torch.enable_grad() if (is_viz_batch and grad_cam_engine) else torch.no_grad()
+        # Autocast for potential speedup (only on CUDA)
+        with context_manager:
+            # Build input dict
             if selected_model == 'MLP_tabular':
-                inputs = {
-                    "tabular": batch["tabular"].to(device),
-                }
+                inputs = {"tabular": batch["tabular"].to(device)}
             elif selected_model == 'multi_CNN':
                 inputs = {
                     "axial": batch["axial"].to(device),
@@ -276,56 +293,84 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
                 }
             else:
                 raise ValueError(f"Selected model '{selected_model}' not supported.")
+            
             labels = batch["label"].to(device)
+
+            # Enable gradients for Grad-CAM if needed
+            if is_viz_batch and grad_cam_engine:
+                 for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor) and v.dtype == torch.float:
+                        v.requires_grad = True
 
             # Forward pass
             logits = model(inputs)
 
-            # Compute validation loss on logits
+            # Compute validation loss
             loss = criterion(logits, labels)
-            # Apply sigmoid to get probabilities.
+            
+            # Metrics computation
             probs = torch.sigmoid(logits)
-            # Threshold probabilities (0/1)
             preds = (probs >= 0.5).float()
 
+            # Generate Grad-CAM visualizations if needed
+            if is_viz_batch and grad_cam_engine:
+                # Limited to images_per_epoch samples
+                num_imgs = min(len(labels), images_per_epoch)
 
+                try:
+                    for i in range(num_imgs):
+                        # Prepare single input dict for GradCAM
+                        single_input = {k: v[i].unsqueeze(0) for k, v in inputs.items()}
+                        # Generate CAMs for each view   
+                        cam_ax, cam_sag, cam_cor = grad_cam_engine.generate_maps(single_input, target_category=None)
+                        # Overlay heatmaps on original images
+                        viz_ax = overlay_heatmap(inputs['axial'][i], cam_ax)
+                        viz_sag = overlay_heatmap(inputs['sagittal'][i], cam_sag)
+                        viz_cor = overlay_heatmap(inputs['coronal'][i], cam_cor)
+                        # Create montage
+                        montage = np.hstack([viz_ax, viz_sag, viz_cor])
+
+                        caption = (f"ID: {batch['id'][i]} | "
+                                   f"GT: {int(labels[i].item())} | "
+                                   f"Pred: {int(preds[i].item())} ({probs[i].item():.2f})")
+                        
+                        wandb_images.append(wandb.Image(montage, caption=caption))
+                        
+                except Exception as e:
+                    print(f"Error generating GradCAM for batch {batch_idx}: {e}")
+
+            # Accumulate metrics
             losses.append(loss.item())
             y_true.append(labels.detach().cpu())
             y_pred.append(preds.detach().cpu())
             y_prob.append(probs.detach().cpu())
 
-            # Save the first batch for logging images later (once per epoch).
-            if log_images and (first_batch_for_images is None):
-                first_batch_for_images = batch
-                first_batch_probs = probs.detach().cpu()
-                first_batch_preds = preds.detach().cpu()
 
-
+    # Aggregate all predictions
     y_true = torch.cat(y_true).numpy().astype(int)
     y_pred = torch.cat(y_pred).numpy().astype(int)
     y_prob = torch.cat(y_prob).numpy()
 
-    # Aggregate scalar metrics.
+    # Aggregate scalar metrics
     val_loss = float(np.mean(losses)) if len(losses) else 0.0
     val_acc = float((y_pred == y_true).mean()) if len(y_true) else 0.0
 
-    # AUC + ROC are only defined if both classes appear in y_true.
+    # AUC + ROC calculation
     if len(np.unique(y_true)) == 2:
-        val_auc = float(roc_auc_score(y_true, y_prob))
-        fpr, tpr, _ = roc_curve(y_true, y_prob)
+        try:
+            val_auc = float(roc_auc_score(y_true, y_prob))
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+        except ValueError:
+            val_auc = float("nan")
+            fpr, tpr = None, None
     else:
         val_auc = float("nan")
         fpr, tpr = None, None
 
-    # Log images to wandb (see in utils.py)
-    if log_images and (first_batch_for_images is not None) and (images_per_epoch > 0):
-        log_val_images_to_wandb(
-            batch=first_batch_for_images,
-            probs=first_batch_probs,  
-            preds=first_batch_preds,  
-            max_items=images_per_epoch,
-            step=step
-        )
+    # Log images to wandb
+    if log_images and len(wandb_images) > 0:
+        wandb.log({"val_gradcam_analysis": wandb_images}, step=step)
+        
 
     return val_loss, val_acc, val_auc, (fpr, tpr), y_true, y_pred, y_prob
 
