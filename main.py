@@ -25,7 +25,7 @@ from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb,
 # --- IMPORT PER XAI ---
 from utils_xai import MultiViewGradCAM, overlay_heatmap
 
-# Costanti di normalizzazione (ImageNet)
+# Costanti ImageNet (le stesse usate nel transform)
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -51,26 +51,26 @@ def get_transforms():
     
     return train_transform, val_transform
 
-def denormalize(tensor):
+def denormalize_tensor(tensor):
     """
-    Inverte la normalizzazione ImageNet per la visualizzazione.
-    Input: Tensor (C, H, W) normalizzato.
-    Output: Numpy Array (H, W, C) in range [0, 255] uint8.
+    Inverte la normalizzazione ImageNet ma mantiene il tipo TENSOR.
+    Input: Tensor (C, H, W) normalizzato (range approx -2 a +2)
+    Output: Tensor (C, H, W) denormalizzato (range 0 a 1)
     """
-    # Clone per non modificare il tensore originale usato per i gradienti
-    t = tensor.clone().detach().cpu()
+    # Clone per non rompere il grafo computazionale o modificare l'originale
+    t = tensor.clone().detach()
     
-    # Inverti normalizzazione: pixel = (pixel * std) + mean
+    # Assicuriamoci che sia su CPU per operazioni semplici, o lasciamo su device
+    # Se overlay_heatmap fa .cpu(), meglio lasciarglielo fare.
+    # Qui facciamo l'operazione matematica inversa: pixel = (pixel * std) + mean
+    
+    # Poiché t è (C, H, W), iteriamo sui canali
     for t_c, m, s in zip(t, IMAGENET_MEAN, IMAGENET_STD):
         t_c.mul_(s).add_(m)
     
-    # Clamping per sicurezza (evita valori <0 o >1 dovuti a arrotondamenti)
+    # Clamping per stare sicuri tra 0 e 1
     t = torch.clamp(t, 0, 1)
-    
-    # Converti a numpy (H, W, C) e poi a uint8
-    img_np = t.permute(1, 2, 0).numpy()
-    img_np = (img_np * 255).astype(np.uint8)
-    return img_np
+    return t
 
 def run_test_pipeline(
     args, 
@@ -80,9 +80,6 @@ def run_test_pipeline(
     output_csv="test_predictions.csv",
     log_images_to_wandb=True
 ):
-    """
-    Run the test pipeline and log ALL results to a WandB Table.
-    """
     print("Testing Pipeline")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -194,26 +191,25 @@ def run_test_pipeline(
             all_labels.extend(labels.detach().cpu().numpy())
             all_ids.extend(ids)
 
-            # --- LOGGING WANDB CON DENORMALIZZAZIONE ---
+            # --- LOGGING WANDB CON DENORMALIZZAZIONE TENSOR-FRIENDLY ---
             if log_images_to_wandb and grad_cam:
                 batch_size_curr = len(ids)
                 for i in range(batch_size_curr):
                     try:
                         single_input = {k: v[i].unsqueeze(0) for k, v in inputs.items()}
-                        
-                        # Genera mappe di attivazione
                         cam_ax, cam_sag, cam_cor = grad_cam.generate_maps(single_input)
                         
-                        # --- MODIFICA CHIAVE: Denormalizza le immagini prima dell'overlay ---
-                        img_ax_vis = denormalize(inputs['axial'][i])
-                        img_sag_vis = denormalize(inputs['sagittal'][i])
-                        img_cor_vis = denormalize(inputs['coronal'][i])
+                        # Usa denormalize_tensor invece che numpy
+                        # Così overlay_heatmap riceve un Tensor (0-1) e può fare .cpu() internamente
+                        img_ax_vis = denormalize_tensor(inputs['axial'][i])
+                        img_sag_vis = denormalize_tensor(inputs['sagittal'][i])
+                        img_cor_vis = denormalize_tensor(inputs['coronal'][i])
 
-                        # Overlay (passiamo immagini denormalizzate in 0-255)
                         viz_ax = overlay_heatmap(img_ax_vis, cam_ax)
                         viz_sag = overlay_heatmap(img_sag_vis, cam_sag)
                         viz_cor = overlay_heatmap(img_cor_vis, cam_cor)
                         
+                        # Se viz_ax è uint8 numpy (probabile output di overlay_heatmap), ok.
                         border = np.ones((viz_ax.shape[0], 5, 3), dtype=np.uint8) * 255
                         montage = np.hstack([viz_ax, border, viz_sag, border, viz_cor])
                         
@@ -253,7 +249,7 @@ def run_test_pipeline(
 
 def validation(model, val_loader, device, criterion, selected_model, log_images=True, images_per_epoch=20, step=None):
     """
-    Validation loop with partial Grad-CAM logging (Denormalized).
+    Validation loop with partial Grad-CAM logging (Denormalized Tensor).
     """
     print('Starting Validation')
     model.eval()
@@ -297,10 +293,10 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
                         single_input = {k: v[i].unsqueeze(0) for k, v in inputs.items()}
                         cam_ax, cam_sag, cam_cor = grad_cam_engine.generate_maps(single_input)
                         
-                        # --- MODIFICA CHIAVE: Denormalizza le immagini prima dell'overlay ---
-                        img_ax_vis = denormalize(inputs['axial'][i])
-                        img_sag_vis = denormalize(inputs['sagittal'][i])
-                        img_cor_vis = denormalize(inputs['coronal'][i])
+                        # --- FIX: Denormalize ma restituisce Tensor ---
+                        img_ax_vis = denormalize_tensor(inputs['axial'][i])
+                        img_sag_vis = denormalize_tensor(inputs['sagittal'][i])
+                        img_cor_vis = denormalize_tensor(inputs['coronal'][i])
 
                         viz_ax = overlay_heatmap(img_ax_vis, cam_ax)
                         viz_sag = overlay_heatmap(img_sag_vis, cam_sag)
@@ -388,6 +384,11 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
             best_val_acc = val_acc
             ckpt_path = os.path.join(save_dir, "best_model.pth")
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "best_val_acc": best_val_acc}, ckpt_path)
+            
+            # --- MODIFICA WANDB SAVE: Salva il modello anche su cloud ---
+            wandb.save(ckpt_path)
+            # ------------------------------------------------------------
+            
             wandb.run.summary["best_val_acc"] = best_val_acc
             print(f" Saved best model (val_acc={best_val_acc:.4f})")
 

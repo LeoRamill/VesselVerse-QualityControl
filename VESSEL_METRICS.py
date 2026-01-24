@@ -31,9 +31,17 @@ from scipy.ndimage import distance_transform_edt
 from scipy.interpolate import splprep, splev, interp1d
 from sklearn.linear_model import LinearRegression
 from collections import defaultdict
+from typing import Union # <-- MODIFICA 1: Aggiunto per compatibilità Python 3.8
 
-
-
+# --- MODIFICA 2: Spostato all_keys qui per renderlo globale e importabile ---
+ALL_METRIC_KEYS = [
+    'total_length', 'num_bifurcations', 'bifurcation_density', 'volume',
+    'fractal_dimension', 'lacunarity', 'geodesic_length', 'avg_diameter',
+    'spline_mean_curvature','spline_rms_curvature',
+    'num_loops', 'num_abnormal_degree_nodes',
+    'mean_loop_length', 'max_loop_length'
+]
+# -------------------------------------------------------------------------
 
 
 def compute_tortuosity_metrics(points, smoothing=0, n_samples=500, counts=None):
@@ -220,8 +228,6 @@ def calculate_lacunarity(points, box_size):
 
 
 
-
-
 def analyze_component_structure(G_comp):
     """
     Calculates the number of loops, the number of nodes with abnormal degree (> 3),
@@ -390,7 +396,62 @@ def prune_graph(G):
     return G
 
 
-def aggregate_segmentation_metrics(output_folder: str, top_k: int | None = None):
+# --- MODIFICA 3: Estrazione di _aggregate in scope globale ---
+def _aggregate(sub_df: pd.DataFrame, prefix: str = '') -> dict:
+    """Helper function to aggregate metrics from a component DataFrame."""
+    res: dict[str, float | int] = {}
+
+    # Column groups
+    sum_fields = [
+        'total_length', 'num_bifurcations', 'volume',
+        'num_loops', 'num_abnormal_degree_nodes'
+    ]
+    length_weight_avg_fields = [
+        'Largest_endpoint_root_mean_curvature', 'Largest_endpoint_root_mean_square_curvature',
+        '2nd_Largest_endpoint_root_mean_curvature', '2nd_Largest_endpoint_root_mean_square_curvature',
+        'Largest_bifurcation_root_mean_curvature', 'Largest_bifurcation_root_mean_square_curvature',
+        'fractal_dimension', 'lacunarity', 'avg_diameter'
+    ]
+
+    # a) Simple sums
+    for col in sum_fields:
+        res[prefix + col] = sub_df[col].fillna(0).sum() if col in sub_df else 0.0
+
+    # b) Length-weighted means
+    for col in length_weight_avg_fields:
+        if col not in sub_df:
+            res[prefix + col] = np.nan
+            continue
+        valid      = sub_df[[col, 'total_length']].dropna(subset=[col])
+        length_sum = valid['total_length'].sum()
+        res[prefix + col] = (
+            (valid[col] * valid['total_length']).sum() / length_sum
+            if length_sum > 0 else np.nan
+        )
+
+    # c) global mean / max loop length (properly weighted)
+    if {'mean_loop_length', 'num_loops'}.issubset(sub_df.columns):
+        tmp         = sub_df[['mean_loop_length', 'num_loops']].fillna(0)
+        loops_total = tmp['num_loops'].sum()
+        res[prefix + 'global_mean_loop_length'] = (
+            (tmp['mean_loop_length'] * tmp['num_loops']).sum() / loops_total
+            if loops_total > 0 else np.nan
+        )
+    else:
+        res[prefix + 'global_mean_loop_length'] = np.nan
+
+    res[prefix + 'global_max_loop_length'] = (
+        sub_df['max_loop_length'].max() if 'max_loop_length' in sub_df else np.nan
+    )
+
+    # d) Component count
+    res[prefix + 'num_components']     = len(sub_df)
+
+    return res
+# -------------------------------------------------------------------------
+
+
+def aggregate_segmentation_metrics(output_folder: str, top_k: Union[int, None] = None): # <-- MODIFICA 1: Corretto il tipo
     """
     Aggregates per-component metrics into whole-mask statistics and (optionally) into
     Top-K-by-length statistics.
@@ -416,68 +477,14 @@ def aggregate_segmentation_metrics(output_folder: str, top_k: int | None = None)
     df = pd.read_csv(input_csv)
     if df.empty:
         raise ValueError(f"'{input_csv}' is empty.")
-
-    # 2)Column groups
-    sum_fields = [
-        'total_length', 'num_bifurcations', 'volume',
-        'num_loops', 'num_abnormal_degree_nodes'
-    ]
-
-    length_weight_avg_fields = [
-        'Largest_endpoint_root_mean_curvature', 'Largest_endpoint_root_mean_square_curvature',
-        '2nd_Largest_endpoint_root_mean_curvature', '2nd_Largest_endpoint_root_mean_square_curvature',
-        'Largest_bifurcation_root_mean_curvature', 'Largest_bifurcation_root_mean_square_curvature',
-        'fractal_dimension', 'lacunarity', 'avg_diameter'
-    ]
-
-    # 3)Function Used to aggregate
-    def _aggregate(sub_df: pd.DataFrame, prefix: str = '') -> dict:
-        res: dict[str, float | int] = {}
-
-        # a) Simple sums
-        for col in sum_fields:
-            res[prefix + col] = sub_df[col].fillna(0).sum() if col in sub_df else 0.0
-
-        # b) Length-weighted means
-        for col in length_weight_avg_fields:
-            if col not in sub_df:
-                res[prefix + col] = np.nan
-                continue
-            valid      = sub_df[[col, 'total_length']].dropna(subset=[col])
-            length_sum = valid['total_length'].sum()
-            res[prefix + col] = (
-                (valid[col] * valid['total_length']).sum() / length_sum
-                if length_sum > 0 else np.nan
-            )
-
-        # c) global mean / max loop length (properly weighted)
-        if {'mean_loop_length', 'num_loops'}.issubset(sub_df.columns):
-            tmp         = sub_df[['mean_loop_length', 'num_loops']].fillna(0)
-            loops_total = tmp['num_loops'].sum()
-            res[prefix + 'global_mean_loop_length'] = (
-                (tmp['mean_loop_length'] * tmp['num_loops']).sum() / loops_total
-                if loops_total > 0 else np.nan
-            )
-        else:
-            res[prefix + 'global_mean_loop_length'] = np.nan
-
-        res[prefix + 'global_max_loop_length'] = (
-            sub_df['max_loop_length'].max() if 'max_loop_length' in sub_df else np.nan
-        )
-
-        # d) Component count
-        res[prefix + 'num_components']     = len(sub_df)
-
-        return res
-
+    
     # 4) Aggregate whole mask
-    agg_all = _aggregate(df)
+    agg_all = _aggregate(df) # <-- MODIFICA 3: Chiama la funzione globale
 
     # 5) Aggregate Top-K (if requested)
-
     if top_k is not None and top_k > 0:
         df_topk  = df.nlargest(top_k, 'total_length')
-        agg_topk = _aggregate(df_topk, prefix=f'Top{top_k}_')
+        agg_topk = _aggregate(df_topk, prefix=f'Top{top_k}_') # <-- MODIFICA 3: Chiama la funzione globale
 
         agg_topk.pop(f'Top{top_k}_num_components', None)
 
@@ -491,11 +498,12 @@ def aggregate_segmentation_metrics(output_folder: str, top_k: int | None = None)
     print(f"Aggregated metrics written to {out_csv}")
 
 
-
-def save_results(results, output_folder, save_conn_comp_masks=True, save_seg_masks=True):
-    
-    os.makedirs(output_folder, exist_ok=True)
-
+# --- MODIFICA 4: Creata nuova funzione helper da logica di save_results ---
+def get_component_rows_from_results(results):
+    """
+    Converts the raw results dictionary from process() into a list of
+    dictionaries (rows), one per component, ready for aggregation.
+    """
     # Keys to include from the top‐level general data
     general_keys = [
         'total_length', 'num_bifurcations', 'bifurcation_density',
@@ -505,7 +513,6 @@ def save_results(results, output_folder, save_conn_comp_masks=True, save_seg_mas
         'mean_loop_length', 'max_loop_length'
     ]
 
-    # Will accumulate one row per component
     all_rows = []
 
     # Sort components by total_length descending
@@ -517,8 +524,6 @@ def save_results(results, output_folder, save_conn_comp_masks=True, save_seg_mas
 
     for new_idx, (cid, data) in enumerate(sorted_items):
         comp_idx = new_idx + 1
-        comp_dir = os.path.join(output_folder, f"Conn_comp_{comp_idx}")
-        os.makedirs(comp_dir, exist_ok=True)
 
         # Build this component’s row
         row = {'component_index': comp_idx}
@@ -526,7 +531,6 @@ def save_results(results, output_folder, save_conn_comp_masks=True, save_seg_mas
         for k in general_keys:
             row[k] = data.get(k, np.nan)
             
-
         # Aggregated tortuosity by root
         agg = data.get('aggregated_tortuosity_by_root', [])
         prefixes = [
@@ -543,15 +547,38 @@ def save_results(results, output_folder, save_conn_comp_masks=True, save_seg_mas
                 row[prefix + 'mean_square_curvature'] = np.nan
 
         all_rows.append(row)
+    
+    return all_rows
+# -------------------------------------------------------------------------
+
+
+def save_results(results, output_folder, save_conn_comp_masks=True, save_seg_masks=True):
+    
+    os.makedirs(output_folder, exist_ok=True)
+
+    # --- MODIFICA 4: Chiama la nuova funzione helper ---
+    all_rows = get_component_rows_from_results(results)
+    # -------------------------------------------------
+
+    # Sort items again just for saving masks in order (logic retained from original)
+    sorted_items = sorted(
+        results.items(),
+        key=lambda item: item[1].get('total_length', 0),
+        reverse=True
+    )
+    
+    for new_idx, (cid, data) in enumerate(sorted_items):
+        comp_idx = new_idx + 1
+        comp_dir = os.path.join(output_folder, f"Conn_comp_{comp_idx}")
+        os.makedirs(comp_dir, exist_ok=True)
 
         # Component skeleton
-        if save_conn_comp_masks:
+        if save_conn_comp_masks and 'reconstructed_conn_comp' in data:
             nib.save(
                 data['reconstructed_conn_comp'],
                 os.path.join(comp_dir, f'Conn_comp_{comp_idx}_skeleton.nii.gz')
             )
         
-
         # Segments as before
         if 'segments_by_root' in data:
             segs_dir = os.path.join(comp_dir, 'Segments')
@@ -610,12 +637,13 @@ def process(mask_path, selected_metrics,save_conn_comp_masks=True,save_seg_masks
         arr            = img.get_fdata() > 0
         affine, header = img.affine, img.header
     else:
-        loaded         = np.load(mask_path)
-        arr            = (next(iter(loaded.values())) if isinstance(loaded, dict) else loaded) > 0
-        affine, header = np.eye(4), nib.Nifti1Header()
-
-
-
+        try:
+            loaded         = np.load(mask_path)
+            arr            = (next(iter(loaded.values())) if isinstance(loaded, dict) else loaded) > 0
+            affine, header = np.eye(4), nib.Nifti1Header()
+        except Exception as e:
+            print(f"Errore nel caricamento di {mask_path}: {e}")
+            return {} # Ritorna dizionario vuoto in caso di fallimento
 
     # 2) Clean, skeletonize, dist map, graph
     #clean    = remove_small_objects(arr, min_size=min_size)  -> Removed since it can erase information
@@ -636,14 +664,18 @@ def process(mask_path, selected_metrics,save_conn_comp_masks=True,save_seg_masks
     ])
 
     results = {}
-
+    
     # 3) Process each connected component
-    for cid, comp_nodes in enumerate(nx.connected_components(G)):
+    components = list(nx.connected_components(G))
+    if not components:
+        print(f"Attenzione: Nessun componente connesso trovato per {mask_path}. Lo scheletro potrebbe essere vuoto.")
+        return {}
+        
+    for cid, comp_nodes in enumerate(components):
         Gc   = G.subgraph(comp_nodes)
         data = {}
 
         # Save the reconstructed component skeleton if desired
-        
         if save_conn_comp_masks:
             vessel_mask = np.zeros_like(skel, dtype=bool)
             for node in Gc.nodes:
@@ -663,6 +695,7 @@ def process(mask_path, selected_metrics,save_conn_comp_masks=True,save_seg_masks
             data['reconstructed_conn_comp'] = nib.Nifti1Image(vessel_mask.astype(np.uint8), affine, header)
 
         # General metrics
+        total_len = 0.0 # Inizializza qui
         if need_general:
             num_bif   = sum(1 for _,deg in Gc.degree() if deg>=3)
             total_len = sum(d['weight'] for *_,d in Gc.edges(data=True))
@@ -678,9 +711,17 @@ def process(mask_path, selected_metrics,save_conn_comp_masks=True,save_seg_masks
                     r_avg = (dist_map[u]+dist_map[v]) / 2
                     vol += np.pi*(r_avg**2)*d['weight']
                 data['volume'] = vol
+        
+        # Calcola total_len anche se need_general è falso, se serve per avg_diameter
+        if 'avg_diameter' in selected_metrics and not need_general:
+             total_len = sum(d['weight'] for *_,d in Gc.edges(data=True))
+
 
         # Fractal & Lacunarity
         coords = np.array(list(Gc.nodes()))
+        if not coords.any():
+            continue # Salta questo componente se non ha nodi
+            
         if need_fractal and 'fractal_dimension' in selected_metrics:
             data['fractal_dimension'] = fractal_dimension(coords)
         if need_lac and 'lacunarity' in selected_metrics:
@@ -708,7 +749,11 @@ def process(mask_path, selected_metrics,save_conn_comp_masks=True,save_seg_masks
                     num  += diam * d['weight']
                 data['avg_diameter'] = num / total_len
             else:
-                data['avg_diameter'] = np.nan
+                # Prova a calcolare avg_diameter dai nodi se non ci sono archi
+                if not Gc.edges() and Gc.nodes():
+                    data['avg_diameter'] = np.mean([2*dist_map[tuple(p)] for p in Gc.nodes()])
+                else:
+                    data['avg_diameter'] = np.nan
 
             
                 
@@ -730,6 +775,7 @@ def process(mask_path, selected_metrics,save_conn_comp_masks=True,save_seg_masks
 
                 for seg in seg_list:
                     pts = np.array(seg)
+                    if pts.shape[0] < 2: continue # Salta segmenti con meno di 2 punti
                     sm  = {}
 
                     # geodesic length
@@ -811,15 +857,9 @@ if __name__ == '__main__':
 
     args = p.parse_args()
 
-    all_keys = [
-        'total_length', 'num_bifurcations', 'bifurcation_density', 'volume',
-        'fractal_dimension', 'lacunarity', 'geodesic_length', 'avg_diameter',
-        'spline_mean_curvature','spline_rms_curvature',
-        'num_loops', 'num_abnormal_degree_nodes',
-        'mean_loop_length', 'max_loop_length'
-    ]
-    selected = set(args.metrics) if args.metrics else set(all_keys)
-    invalid  = selected - set(all_keys)
+    # Usa la variabile globale ALL_METRIC_KEYS
+    selected = set(args.metrics) if args.metrics else set(ALL_METRIC_KEYS)
+    invalid  = selected - set(ALL_METRIC_KEYS)
     if invalid:
         raise ValueError(f'Invalid metrics: {invalid}')
 
@@ -827,7 +867,9 @@ if __name__ == '__main__':
     save_conn_comp_masks = not args.no_conn_comp_masks
 
     results = process(args.input, selected, save_conn_comp_masks, save_seg_masks)
-    save_results(results, args.output_folder, save_conn_comp_masks, save_seg_masks)
-    aggregate_segmentation_metrics(os.path.abspath(args.output_folder), top_k=args.topK)
-
-    print(f'Results saved to: {os.path.abspath(args.output_folder)}')
+    if results:
+        save_results(results, args.output_folder, save_conn_comp_masks, save_seg_masks)
+        aggregate_segmentation_metrics(os.path.abspath(args.output_folder), top_k=args.topK)
+        print(f'Results saved to: {os.path.abspath(args.output_folder)}')
+    else:
+        print(f"Processamento di {args.input} non ha prodotto risultati, nessun file salvato.")
