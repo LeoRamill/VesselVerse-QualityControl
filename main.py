@@ -385,7 +385,19 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
 
 def log_combined_plot(train_hist, val_hist, metric_name, epoch):
     """
-    Crea un grafico Matplotlib con Train e Val sovrapposti e lo logga su WandB.
+    Generate and log a combined plot for training and validation metrics to WandB.
+    
+    Parameters
+    ----------
+    train_hist : list
+        List of training metric values per epoch.
+    val_hist : list
+        List of validation metric values per epoch.
+    metric_name : str   
+        Name of the metric (e.g., 'Loss', 'Accuracy').
+    epoch : int
+        Current epoch number for logging.
+ 
     """
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, len(train_hist) + 1), train_hist, label=f'Train {metric_name}', marker='o')
@@ -396,20 +408,55 @@ def log_combined_plot(train_hist, val_hist, metric_name, epoch):
     plt.legend()
     plt.grid(True)
     
-    # Logga l'immagine su WandB
+    # Log to WandB
     wandb.log({f"Combined_Plots/{metric_name}": wandb.Image(plt)}, step=epoch)
-    plt.close() # Chiude la figura per liberare memoria
+    plt.close() 
 
 
 def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs, save_dir="./checkpoints", use_amp=True, images_per_epoch=20, selected_model='multimodal'):
-    
+    """
+    Train a multi-view model validate each epoch.
+
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Network to optimize.
+    train_loader, val_loader : torch.utils.data.DataLoader
+        Training and validation dataloaders.
+    optimizer : torch.optim.Optimizer
+        Optimizer for model parameters.
+    lr : float
+        Initial/base learning rate used by the polynomial scheduler.
+    device : torch.device
+        Target device for tensors and model.
+    num_epochs : int
+        Number of training epochs.
+    save_dir : str, optional
+        Directory to store checkpoints.
+    use_amp : bool, optional
+        Enable AMP on CUDA for faster training and lower memory usage.
+    images_per_epoch : int, optional
+        Number of validation images (three views) to log via wandb each epoch.
+    selected_model : str, optional
+        Selected model type among {'multi_CNN', 'MLP_tabular', 'multimodal'}.
+
+    Returns
+    -------
+    float
+        Best validation accuracy observed.
+    """
+    # Ensure checkpoint directory exists.
     os.makedirs(save_dir, exist_ok=True)
+    # Loss function setup
     criterion = torch.nn.BCEWithLogitsLoss()
+    # Enable AMP only when CUDA is available
     amp_enabled = bool(use_amp and device.type == "cuda")
+    # GradScaler prevents underflow in float16 gradients when AMP is enabled.
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     best_val_acc = 0.0
 
-    # --- STORICO METRICHE PER GRAFICI UNIFICATI ---
+
     history = {
         "loss_train": [], "loss_val": [],
         "acc_train": [],  "acc_val": [],
@@ -418,15 +465,17 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
     }
 
     for epoch in range(1, num_epochs + 1):
+        # Update learning rate by using polynomial schedule.
         poly_lr_scheduler(optimizer, lr, epoch)
         print('Starting Training Epoch', epoch)
+        # Training phase
         model.train()
-        
         train_losses = []
         train_preds_list = []
         train_labels_list = []
 
         for batch in train_loader:
+            # Move batch to device and build multi-view inputs (see dataset structure in MRAVesselMultiViewDataset)
             if selected_model == 'MLP_tabular':
                 inputs = {"tabular": batch["tabular"].to(device)}
             elif selected_model == 'multi_CNN':
@@ -434,12 +483,14 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
             elif selected_model == 'multimodal':
                 inputs = {"axial": batch["axial"].to(device), "sagittal": batch["sagittal"].to(device), "coronal": batch["coronal"].to(device), "tabular": batch["tabular"].to(device)}
             labels = batch["label"].to(device)
-
+            # Clear previous gradients
             optimizer.zero_grad()
+            # Autocast runs some ops in float16/bfloat16 for speed on GPU.
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 logits = model(inputs)
                 loss = criterion(logits, labels)
-
+            
+            # Backpropagation
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -451,7 +502,7 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
             train_preds_list.append(preds.detach().cpu())
             train_labels_list.append(labels.detach().cpu())
 
-        # Calcolo metriche Training
+        # Average training loss for the epoch.
         train_loss = float(np.mean(train_losses)) if len(train_losses) else 0.0
         train_all_preds = torch.cat(train_preds_list).numpy().astype(int)
         train_all_labels = torch.cat(train_labels_list).numpy().astype(int)
@@ -460,13 +511,12 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
         train_f1 = f1_score(train_all_labels, train_all_preds, average='binary')
         train_prec = precision_score(train_all_labels, train_all_preds, average='binary', zero_division=0)
 
-        # Validation Step
+        # Validation phase
         val_loss, val_acc, val_auc, val_f1, val_prec, (fpr, tpr) = validation(
             model=model, val_loader=val_loader, device=device, criterion=criterion, 
             selected_model=selected_model, log_images=True, images_per_epoch=images_per_epoch, step=epoch
         )
 
-        # --- AGGIORNAMENTO STORICO ---
         history["loss_train"].append(train_loss)
         history["loss_val"].append(val_loss)
         history["acc_train"].append(train_acc)
@@ -475,8 +525,8 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
         history["f1_val"].append(val_f1)
         history["prec_train"].append(train_prec)
         history["prec_val"].append(val_prec)
-
-        # --- LOG STANDARD WANDB (Crea i grafici interattivi separati di default) ---
+        
+        # Log scalar metrics to W&B for this epoch.
         log_dict = {
             "epoch": epoch,
             "Loss/Train": train_loss,
@@ -491,7 +541,7 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
         }
         wandb.log(log_dict, step=epoch)
 
-        # --- GENERAZIONE GRAFICI COMBINATI (Immagini statiche con curve sovrapposte) ---
+
         log_combined_plot(history["loss_train"], history["loss_val"], "Loss", epoch)
         log_combined_plot(history["acc_train"], history["acc_val"], "Accuracy", epoch)
         log_combined_plot(history["f1_train"], history["f1_val"], "F1-Score", epoch)
@@ -510,10 +560,8 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
 
     return best_val_acc
 
-# --- MAIN RIMANE INVARIATO MA RICHIAMA IL NUOVO TRAINING ---
 def main():
     parser = argparse.ArgumentParser()
-    # ... (Tutti gli argomenti di prima) ...
     parser.add_argument("--root_dir", type=str, required=True)
     parser.add_argument("--excel_path", type=str, required=True)
     parser.add_argument("--selected_model", type=str, required=True)
@@ -537,8 +585,6 @@ def main():
 
     args = parser.parse_args()
 
-    # ... (Setup random seed, Wandb init, Dataset loading, Scaler...) ...
-    # (Tutto uguale a prima fino alla chiamata di training)
     
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -546,23 +592,25 @@ def main():
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(args.seed)
 
     wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
-    
+    # Load the tabular data to perform group-wise splitting
     df = pd.read_excel(args.excel_path)
+    # Extract patient IDs (without model suffix) for group-wise splitting
     ids_all = df["file_sorgente"].astype(str).values
     patient_ids_all = np.array([s.rsplit("_", 1)[0] for s in ids_all])
     idx_all = np.arange(len(df))
+    # Group-wise split: patients in train and val sets do not overlap
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
     tr_rows, va_rows = next(gss.split(idx_all, groups=patient_ids_all))
-    
+    # Determine tabular columns (numeric columns excluding drop_cols)
     drop_cols = {"file_sorgente", "label1", "label2"}
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     tab_cols = [c for c in numeric_cols if c not in drop_cols]
-    
+    # Fit scaler on training tabular data
     scaler = StandardScaler()
     scaler.fit(df.iloc[tr_rows][tab_cols].astype(np.float32).values)
-    
+    # Get data transforms
     train_transform, val_transform = get_transforms()
-    
+    # Prepare dataset and data loaders
     train_dataset_full = MRAVesselMultiViewDataset(
         root_dir=args.root_dir,
         excel_path=args.excel_path,
@@ -582,19 +630,35 @@ def main():
         drop_cols=list(drop_cols),
         transform=val_transform
     )
-    
+    print("Samples of dataset (total):", len(train_dataset_full))
+    # Select splitting strategy (random or group-wise)
     if args.split_strategy == 'group_wise':
+        # Use precomputed group-wise split
+        print("Using Group-Wise Split strategy...")
         train_ds = Subset(train_dataset_full, tr_rows)
         val_ds = Subset(val_dataset_full, va_rows)
+
+        # Check overlap
+        train_pats = set(patient_ids_all[tr_rows])
+        val_pats = set(patient_ids_all[va_rows])
+        overlap = train_pats.intersection(val_pats)
+        print(f"Overlap patients train/val: {len(overlap)}")
     else:
+        # Random split
+        print("Using Random Split strategy...")
         dataset_len = len(train_dataset_full)
         n_val = int(dataset_len * args.val_ratio)
         n_train = dataset_len - n_val
+        # Generate reproducible random indices
         generator = torch.Generator().manual_seed(args.seed)
         indices = torch.randperm(dataset_len, generator=generator).tolist()
+        # Override tr_rows/va_rows for this specific run
         train_ds = Subset(train_dataset_full, indices[:n_train])
         val_ds = Subset(val_dataset_full, indices[n_train:])    
 
+    print("Training samples:", len(train_ds))
+    print("Validation samples:", len(val_ds))
+    # Data loaders
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
@@ -607,11 +671,11 @@ def main():
     elif args.selected_model == 'multimodal':
         model = MultiModalMultiViewResNet(train_dataset_full.tabular_dim, args.backbone, True, 64, 128, args.hidden_dim, 0.5).to(device)
     else:
-        print('Not supported model'); return
+        print('Not supported model')
+        return
 
     optimizer = select_optimizer(args, model)
-    
-    # Training (Qui verrà usata la nuova funzione)
+    # Start training
     best_val_acc = training(model, train_loader, val_loader, optimizer, args.lr, device, args.epochs, "./checkpoints_multiview", selected_model=args.selected_model)
     print("Best val accuracy:", best_val_acc)
     wandb.finish()
@@ -620,6 +684,7 @@ def main():
     if args.test_excel_path is not None:
         test_run_name = args.wandb_run_name + "_TEST" if args.wandb_run_name else None
         wandb.init(project=args.wandb_project, name=test_run_name, config=vars(args))
+        # Run test pipeline on the provided test excel path
         print("Running test pipeline...")
         test_acc, test_auc = run_test_pipeline(
             args=args,
