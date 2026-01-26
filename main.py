@@ -12,8 +12,9 @@ from torchvision import transforms
 import torchvision 
 import cv2 
 import torch.cuda.amp as amp
-from torch.utils.data import DataLoader, random_split,  Dataset, Subset
-from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, accuracy_score
+from torch.utils.data import DataLoader, random_split, Dataset, Subset
+# --- MODIFICA: Aggiunti f1_score e precision_score ---
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, accuracy_score, f1_score, precision_score
 
 # Import dei modelli e utils originali
 from models.multi_resnet import MultiViewResNet
@@ -25,7 +26,7 @@ from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb,
 # --- IMPORT PER XAI ---
 from utils_xai import MultiViewGradCAM, overlay_heatmap
 
-# Costanti ImageNet (le stesse usate nel transform)
+# Costanti ImageNet
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -54,21 +55,10 @@ def get_transforms():
 def denormalize_tensor(tensor):
     """
     Inverte la normalizzazione ImageNet ma mantiene il tipo TENSOR.
-    Input: Tensor (C, H, W) normalizzato (range approx -2 a +2)
-    Output: Tensor (C, H, W) denormalizzato (range 0 a 1)
     """
-    # Clone per non rompere il grafo computazionale o modificare l'originale
     t = tensor.clone().detach()
-    
-    # Assicuriamoci che sia su CPU per operazioni semplici, o lasciamo su device
-    # Se overlay_heatmap fa .cpu(), meglio lasciarglielo fare.
-    # Qui facciamo l'operazione matematica inversa: pixel = (pixel * std) + mean
-    
-    # Poiché t è (C, H, W), iteriamo sui canali
     for t_c, m, s in zip(t, IMAGENET_MEAN, IMAGENET_STD):
         t_c.mul_(s).add_(m)
-    
-    # Clamping per stare sicuri tra 0 e 1
     t = torch.clamp(t, 0, 1)
     return t
 
@@ -191,7 +181,6 @@ def run_test_pipeline(
             all_labels.extend(labels.detach().cpu().numpy())
             all_ids.extend(ids)
 
-            # --- LOGGING WANDB CON DENORMALIZZAZIONE TENSOR-FRIENDLY ---
             if log_images_to_wandb and grad_cam:
                 batch_size_curr = len(ids)
                 for i in range(batch_size_curr):
@@ -199,8 +188,6 @@ def run_test_pipeline(
                         single_input = {k: v[i].unsqueeze(0) for k, v in inputs.items()}
                         cam_ax, cam_sag, cam_cor = grad_cam.generate_maps(single_input)
                         
-                        # Usa denormalize_tensor invece che numpy
-                        # Così overlay_heatmap riceve un Tensor (0-1) e può fare .cpu() internamente
                         img_ax_vis = denormalize_tensor(inputs['axial'][i])
                         img_sag_vis = denormalize_tensor(inputs['sagittal'][i])
                         img_cor_vis = denormalize_tensor(inputs['coronal'][i])
@@ -209,7 +196,6 @@ def run_test_pipeline(
                         viz_sag = overlay_heatmap(img_sag_vis, cam_sag)
                         viz_cor = overlay_heatmap(img_cor_vis, cam_cor)
                         
-                        # Se viz_ax è uint8 numpy (probabile output di overlay_heatmap), ok.
                         border = np.ones((viz_ax.shape[0], 5, 3), dtype=np.uint8) * 255
                         montage = np.hstack([viz_ax, border, viz_sag, border, viz_cor])
                         
@@ -223,14 +209,19 @@ def run_test_pipeline(
                     except Exception as e:
                         print(f"Error logging image for {ids[i]}: {e}")
 
+    # Calcolo metriche test
     acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='binary')
+    precision = precision_score(all_labels, all_preds, average='binary', zero_division=0)
     try:
         auc = roc_auc_score(all_labels, all_probs)
     except ValueError:
         auc = float('nan')
     
-    print(f"Test Accuracy: {acc:.4f}")
-    print(f"Test AUC:      {auc:.4f}")
+    print(f"Test Accuracy:  {acc:.4f}")
+    print(f"Test F1 Score:  {f1:.4f}")
+    print(f"Test Precision: {precision:.4f}")
+    print(f"Test AUC:       {auc:.4f}")
 
     if save_results:
         results_df = pd.DataFrame({
@@ -249,7 +240,7 @@ def run_test_pipeline(
 
 def validation(model, val_loader, device, criterion, selected_model, log_images=True, images_per_epoch=20, step=None):
     """
-    Validation loop with partial Grad-CAM logging (Denormalized Tensor).
+    Validation loop: Calcola Loss, Acc, AUC, F1, Precision e logga immagini GradCAM.
     """
     print('Starting Validation')
     model.eval()
@@ -293,7 +284,6 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
                         single_input = {k: v[i].unsqueeze(0) for k, v in inputs.items()}
                         cam_ax, cam_sag, cam_cor = grad_cam_engine.generate_maps(single_input)
                         
-                        # --- FIX: Denormalize ma restituisce Tensor ---
                         img_ax_vis = denormalize_tensor(inputs['axial'][i])
                         img_sag_vis = denormalize_tensor(inputs['sagittal'][i])
                         img_cor_vis = denormalize_tensor(inputs['coronal'][i])
@@ -316,8 +306,11 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
     y_true = torch.cat(y_true).numpy().astype(int)
     y_pred = torch.cat(y_pred).numpy().astype(int)
     y_prob = torch.cat(y_prob).numpy()
+    
     val_loss = float(np.mean(losses)) if len(losses) else 0.0
-    val_acc = float((y_pred == y_true).mean()) if len(y_true) else 0.0
+    val_acc = accuracy_score(y_true, y_pred)
+    val_f1 = f1_score(y_true, y_pred, average='binary')
+    val_precision = precision_score(y_true, y_pred, average='binary', zero_division=0)
 
     if len(np.unique(y_true)) == 2:
         try:
@@ -331,11 +324,12 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
     if log_images and len(wandb_images) > 0:
         wandb.log({"val_gradcam_analysis": wandb_images}, step=step)
 
-    return val_loss, val_acc, val_auc, (fpr, tpr), y_true, y_pred, y_prob
+    # Restituisce anche F1 e Precision
+    return val_loss, val_acc, val_auc, val_f1, val_precision, (fpr, tpr)
 
 def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs, save_dir="./checkpoints", use_amp=True, images_per_epoch=20, selected_model='multimodal'):
     """
-    Standard training loop.
+    Standard training loop with Metrics calculation in training phase.
     """
     os.makedirs(save_dir, exist_ok=True)
     criterion = torch.nn.BCEWithLogitsLoss()
@@ -347,7 +341,11 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
         poly_lr_scheduler(optimizer, lr, epoch)
         print('Starting Training Epoch', epoch)
         model.train()
+        
         train_losses = []
+        # --- MODIFICA: Liste per accumulare predizioni training ---
+        train_preds_list = []
+        train_labels_list = []
 
         for batch in train_loader:
             if selected_model == 'MLP_tabular':
@@ -366,29 +364,58 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            
             train_losses.append(loss.item())
+            
+            # --- MODIFICA: Calcolo probs e preds per metriche training ---
+            probs = torch.sigmoid(logits)
+            preds = (probs >= 0.5).float()
+            
+            train_preds_list.append(preds.detach().cpu())
+            train_labels_list.append(labels.detach().cpu())
 
+        # Calcolo metriche Training a fine epoca
         train_loss = float(np.mean(train_losses)) if len(train_losses) else 0.0
         
-        val_loss, val_acc, val_auc, (fpr, tpr), y_true, y_pred, y_prob = validation(
+        train_all_preds = torch.cat(train_preds_list).numpy().astype(int)
+        train_all_labels = torch.cat(train_labels_list).numpy().astype(int)
+        
+        train_acc = accuracy_score(train_all_labels, train_all_preds)
+        train_f1 = f1_score(train_all_labels, train_all_preds, average='binary')
+        train_prec = precision_score(train_all_labels, train_all_preds, average='binary', zero_division=0)
+
+        # Validation Step (restituisce più metriche ora)
+        val_loss, val_acc, val_auc, val_f1, val_prec, (fpr, tpr) = validation(
             model=model, val_loader=val_loader, device=device, criterion=criterion, 
             selected_model=selected_model, log_images=True, images_per_epoch=images_per_epoch, step=epoch
         )
 
-        log_dict = {"epoch": epoch, "train/loss": train_loss, "val/loss": val_loss, "val/accuracy": val_acc, "val/auc": val_auc}
+        # --- MODIFICA WANDB: Raggruppamento metriche con "/" ---
+        # Usando "Metrica/Train" e "Metrica/Val", WandB li metterà automaticamente
+        # sullo stesso grafico nella dashboard predefinita.
+        log_dict = {
+            "epoch": epoch,
+            "Loss/Train": train_loss,
+            "Loss/Val": val_loss,
+            "Accuracy/Train": train_acc,
+            "Accuracy/Val": val_acc,
+            "F1_Score/Train": train_f1,
+            "F1_Score/Val": val_f1,
+            "Precision/Train": train_prec,
+            "Precision/Val": val_prec,
+            "AUC/Val": val_auc
+        }
         wandb.log(log_dict, step=epoch)
 
-        print(f"Epoch [{epoch:03d}/{num_epochs}] | train_loss={train_loss:.4f} | val_acc={val_acc:.4f} | val_auc={val_auc:.4f}")
+        print(f"Epoch [{epoch:03d}/{num_epochs}]")
+        print(f"  Train -> Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | F1: {train_f1:.4f}")
+        print(f"  Val   -> Loss: {val_loss:.4f}   | Acc: {val_acc:.4f}   | F1: {val_f1:.4f} | AUC: {val_auc:.4f}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             ckpt_path = os.path.join(save_dir, "best_model.pth")
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "best_val_acc": best_val_acc}, ckpt_path)
-            
-            # --- MODIFICA WANDB SAVE: Salva il modello anche su cloud ---
             wandb.save(ckpt_path)
-            # ------------------------------------------------------------
-            
             wandb.run.summary["best_val_acc"] = best_val_acc
             print(f" Saved best model (val_acc={best_val_acc:.4f})")
 
