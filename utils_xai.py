@@ -90,7 +90,9 @@ class MultiViewGradCAM:
         return cam_ax, cam_sag, cam_cor
 
 def overlay_heatmap(tensor_img_norm, cam_mask):
-    """Overlay the Grad-CAM heatmap on the normalized tensor image.
+    """
+    Overlay the Grad-CAM heatmap on the normalized tensor image.
+    
     Args:
         tensor_img_norm: Tensor immagine normalizzata (3, H, W) float32 0-1
         cam_mask: La maschera di attivazione (H, W) float 0-1
@@ -107,9 +109,11 @@ def overlay_heatmap(tensor_img_norm, cam_mask):
 def overlay_heatmap_original_size(original_image_np, cam_mask):
     """
     Overlay the Grad-CAM heatmap on the original image size.
-    Args:
-        original_image_np: Immagine originale (H, W, 3) uint8 o float32 0-1
-        cam_mask: La maschera di attivazione (H_cam, W_cam) float 0-1
+    
+    Parameters:
+        original_image_np: Immagine originale numpy (H, W, 3) uint8 o float32 0-1
+        cam_mask: La maschera di attivazione (h, w) float 0-1 
+         
     Returns:
         visualization: Immagine sovrapposta (H, W, 3) uint8
     """

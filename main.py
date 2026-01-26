@@ -13,26 +13,27 @@ import torchvision
 import cv2 
 import torch.cuda.amp as amp
 from torch.utils.data import DataLoader, random_split, Dataset, Subset
-# --- MODIFICA: Aggiunti f1_score e precision_score ---
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, accuracy_score, f1_score, precision_score
-
-# Import dei modelli e utils originali
+# Import Models
 from models.multi_resnet import MultiViewResNet
 from models.multi_modal_resnet import MultiModalMultiViewResNet
 from models.mlp import MLP_tabular
 from preprocess.mra_processing import MRAVesselMultiViewDataset
 from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb, poly_lr_scheduler, select_optimizer, select_splitting_strategy
 
-# --- IMPORT PER XAI ---
+# Import for XAI
 from utils_xai import MultiViewGradCAM, overlay_heatmap
 
-# Costanti ImageNet
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 def get_transforms():
     """
     Define data augmentations for training and validation.
+    Returns
+    -------
+    tuple
+        (train_transform, val_transform)
     """
     train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -54,7 +55,15 @@ def get_transforms():
 
 def denormalize_tensor(tensor):
     """
-    Inverte la normalizzazione ImageNet ma mantiene il tipo TENSOR.
+    Denormalize a tensor using ImageNet mean and std.
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        Normalized tensor of shape (C, H, W).
+    Returns
+    -------
+    torch.Tensor
+        Denormalized tensor clamped between 0 and 1.
     """
     t = tensor.clone().detach()
     for t_c, m, s in zip(t, IMAGENET_MEAN, IMAGENET_STD):
@@ -68,12 +77,30 @@ def run_test_pipeline(
     model_instance=None, 
     save_results=True,
     output_csv="test_predictions.csv",
-    log_images_to_wandb=True
-):
+    log_images_to_wandb=True):
+    """
+    Run the test pipeline on the provided dataset using a trained model.
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command-line arguments containing dataset and model configurations.
+    checkpoint_path : str, optional
+        Path to the trained model checkpoint. If None, `model_instance` must be provided.
+    model_instance : torch.nn.Module, optional
+        An instance of the trained model. If None, `checkpoint_path` must be provided.
+    save_results : bool, optional
+        If True, save the test predictions to a CSV file.
+    output_csv : str, optional
+        Path to the output CSV file for saving predictions.
+    Returns
+    -------
+    tuple
+        (accuracy, AUC) on the test set.
+    """
     print("Testing Pipeline")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # 1. Preparazione Dati Test
+    # Data Test Preparation
     df = pd.read_excel(args.test_excel_path)
     drop_cols = {"file_sorgente", "label1", "label2"}
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -104,7 +131,7 @@ def run_test_pipeline(
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
     print(f"Test dataset samples: {len(test_dataset)}")
     
-    # 2. Caricamento Modello
+    # Loading Model
     if model_instance is not None:
         model = model_instance
     elif checkpoint_path is not None:
@@ -126,7 +153,7 @@ def run_test_pipeline(
     model.to(device)
     model.eval()
     
-    # 3. Setup WandB Table e GradCAM
+    # Setup WandB Table and GradCAM
     wandb_table = None
     grad_cam = None
     
@@ -209,7 +236,7 @@ def run_test_pipeline(
                     except Exception as e:
                         print(f"Error logging image for {ids[i]}: {e}")
 
-    # Calcolo metriche test
+    # Evaluation Metrics
     acc = accuracy_score(all_labels, all_preds)
     f1 = f1_score(all_labels, all_preds, average='binary')
     precision = precision_score(all_labels, all_preds, average='binary', zero_division=0)
@@ -240,20 +267,47 @@ def run_test_pipeline(
 
 def validation(model, val_loader, device, criterion, selected_model, log_images=True, images_per_epoch=20, step=None):
     """
-    Validation loop: Calcola Loss, Acc, AUC, F1, Precision e logga immagini GradCAM.
+    Run validation for one epoch.
+    
+    
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Multi-view network under evaluation.
+    val_loader : torch.utils.data.DataLoader
+        Loader serving validation batches.
+    device : torch.device
+        Device where inference is run.
+    criterion : torch.nn.Module
+        Loss function (e.g., BCEWithLogitsLoss).
+    selected_model : str
+        Selected model type among {'multi_CNN', 'MLP_tabular', 'multimodal'}.
+    log_images : bool, optional
+        If True, log example triplets from the first validation batch.
+    images_per_epoch : int, optional
+        Maximum number of triplets to log for the epoch.
+    step : int, optional
+        wandb step index (usually epoch).
+
+    Returns
+    -------
+    tuple
+        (val_loss, val_acc, val_auc, val_f1, val_precision, (fpr, tpr))
     """
     print('Starting Validation')
+    # Switch to eval mode
     model.eval()
     losses, y_true, y_pred, y_prob = [], [], [], []
     wandb_images = []
-
+    # Initialize GradCAM engine if logging images
     grad_cam_engine = None
     if log_images and selected_model in ['multi_CNN', 'multimodal']:
         try:
             grad_cam_engine = MultiViewGradCAM(model, device)
         except Exception as e:
             print(f"Warning: Could not initialize GradCAM: {e}")
-
+    
+    # Validation loop
     for batch_idx, batch in enumerate(val_loader):
         is_viz_batch = (batch_idx == 0) and log_images
         context_manager = torch.enable_grad() if (is_viz_batch and grad_cam_engine) else torch.no_grad()
@@ -267,7 +321,7 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
                 inputs = {"axial": batch["axial"].to(device), "sagittal": batch["sagittal"].to(device), "coronal": batch["coronal"].to(device), "tabular": batch["tabular"].to(device)}
             
             labels = batch["label"].to(device)
-
+            # Enable gradients for Grad-CAM if needed
             if is_viz_batch and grad_cam_engine:
                  for k, v in inputs.items():
                     if isinstance(v, torch.Tensor) and v.dtype == torch.float: v.requires_grad = True
@@ -281,17 +335,19 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
                 num_imgs = min(len(labels), images_per_epoch)
                 try:
                     for i in range(num_imgs):
+                        # Prepare single input dict for GradCAM
                         single_input = {k: v[i].unsqueeze(0) for k, v in inputs.items()}
+                        # Generate CAMs for each view
                         cam_ax, cam_sag, cam_cor = grad_cam_engine.generate_maps(single_input)
-                        
+                        # Denormalize images for visualization
                         img_ax_vis = denormalize_tensor(inputs['axial'][i])
                         img_sag_vis = denormalize_tensor(inputs['sagittal'][i])
                         img_cor_vis = denormalize_tensor(inputs['coronal'][i])
-
+                        # Overlay heatmaps on original images
                         viz_ax = overlay_heatmap(img_ax_vis, cam_ax)
                         viz_sag = overlay_heatmap(img_sag_vis, cam_sag)
                         viz_cor = overlay_heatmap(img_cor_vis, cam_cor)
-                        
+                        # Create montage
                         montage = np.hstack([viz_ax, viz_sag, viz_cor])
                         caption = f"ID: {batch['id'][i]} | GT: {int(labels[i].item())} | Pred: {int(preds[i].item())}"
                         wandb_images.append(wandb.Image(montage, caption=caption))
@@ -311,7 +367,7 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
     val_acc = accuracy_score(y_true, y_pred)
     val_f1 = f1_score(y_true, y_pred, average='binary')
     val_precision = precision_score(y_true, y_pred, average='binary', zero_division=0)
-
+    # AUC + ROC calculation
     if len(np.unique(y_true)) == 2:
         try:
             val_auc = float(roc_auc_score(y_true, y_prob))
@@ -324,18 +380,42 @@ def validation(model, val_loader, device, criterion, selected_model, log_images=
     if log_images and len(wandb_images) > 0:
         wandb.log({"val_gradcam_analysis": wandb_images}, step=step)
 
-    # Restituisce anche F1 e Precision
+    # Return metrics
     return val_loss, val_acc, val_auc, val_f1, val_precision, (fpr, tpr)
 
+def log_combined_plot(train_hist, val_hist, metric_name, epoch):
+    """
+    Crea un grafico Matplotlib con Train e Val sovrapposti e lo logga su WandB.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_hist) + 1), train_hist, label=f'Train {metric_name}', marker='o')
+    plt.plot(range(1, len(val_hist) + 1), val_hist, label=f'Val {metric_name}', marker='x', linestyle='--')
+    plt.title(f'{metric_name} Trend (Epoch {epoch})')
+    plt.xlabel('Epochs')
+    plt.ylabel(metric_name)
+    plt.legend()
+    plt.grid(True)
+    
+    # Logga l'immagine su WandB
+    wandb.log({f"Combined_Plots/{metric_name}": wandb.Image(plt)}, step=epoch)
+    plt.close() # Chiude la figura per liberare memoria
+
+
 def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs, save_dir="./checkpoints", use_amp=True, images_per_epoch=20, selected_model='multimodal'):
-    """
-    Standard training loop with Metrics calculation in training phase.
-    """
+    
     os.makedirs(save_dir, exist_ok=True)
     criterion = torch.nn.BCEWithLogitsLoss()
     amp_enabled = bool(use_amp and device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     best_val_acc = 0.0
+
+    # --- STORICO METRICHE PER GRAFICI UNIFICATI ---
+    history = {
+        "loss_train": [], "loss_val": [],
+        "acc_train": [],  "acc_val": [],
+        "f1_train": [],   "f1_val": [],
+        "prec_train": [], "prec_val": []
+    }
 
     for epoch in range(1, num_epochs + 1):
         poly_lr_scheduler(optimizer, lr, epoch)
@@ -343,7 +423,6 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
         model.train()
         
         train_losses = []
-        # --- MODIFICA: Liste per accumulare predizioni training ---
         train_preds_list = []
         train_labels_list = []
 
@@ -367,16 +446,13 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
             
             train_losses.append(loss.item())
             
-            # --- MODIFICA: Calcolo probs e preds per metriche training ---
             probs = torch.sigmoid(logits)
             preds = (probs >= 0.5).float()
-            
             train_preds_list.append(preds.detach().cpu())
             train_labels_list.append(labels.detach().cpu())
 
-        # Calcolo metriche Training a fine epoca
+        # Calcolo metriche Training
         train_loss = float(np.mean(train_losses)) if len(train_losses) else 0.0
-        
         train_all_preds = torch.cat(train_preds_list).numpy().astype(int)
         train_all_labels = torch.cat(train_labels_list).numpy().astype(int)
         
@@ -384,15 +460,23 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
         train_f1 = f1_score(train_all_labels, train_all_preds, average='binary')
         train_prec = precision_score(train_all_labels, train_all_preds, average='binary', zero_division=0)
 
-        # Validation Step (restituisce più metriche ora)
+        # Validation Step
         val_loss, val_acc, val_auc, val_f1, val_prec, (fpr, tpr) = validation(
             model=model, val_loader=val_loader, device=device, criterion=criterion, 
             selected_model=selected_model, log_images=True, images_per_epoch=images_per_epoch, step=epoch
         )
 
-        # --- MODIFICA WANDB: Raggruppamento metriche con "/" ---
-        # Usando "Metrica/Train" e "Metrica/Val", WandB li metterà automaticamente
-        # sullo stesso grafico nella dashboard predefinita.
+        # --- AGGIORNAMENTO STORICO ---
+        history["loss_train"].append(train_loss)
+        history["loss_val"].append(val_loss)
+        history["acc_train"].append(train_acc)
+        history["acc_val"].append(val_acc)
+        history["f1_train"].append(train_f1)
+        history["f1_val"].append(val_f1)
+        history["prec_train"].append(train_prec)
+        history["prec_val"].append(val_prec)
+
+        # --- LOG STANDARD WANDB (Crea i grafici interattivi separati di default) ---
         log_dict = {
             "epoch": epoch,
             "Loss/Train": train_loss,
@@ -406,6 +490,11 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
             "AUC/Val": val_auc
         }
         wandb.log(log_dict, step=epoch)
+
+        # --- GENERAZIONE GRAFICI COMBINATI (Immagini statiche con curve sovrapposte) ---
+        log_combined_plot(history["loss_train"], history["loss_val"], "Loss", epoch)
+        log_combined_plot(history["acc_train"], history["acc_val"], "Accuracy", epoch)
+        log_combined_plot(history["f1_train"], history["f1_val"], "F1-Score", epoch)
 
         print(f"Epoch [{epoch:03d}/{num_epochs}]")
         print(f"  Train -> Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | F1: {train_f1:.4f}")
@@ -421,8 +510,10 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
 
     return best_val_acc
 
+# --- MAIN RIMANE INVARIATO MA RICHIAMA IL NUOVO TRAINING ---
 def main():
     parser = argparse.ArgumentParser()
+    # ... (Tutti gli argomenti di prima) ...
     parser.add_argument("--root_dir", type=str, required=True)
     parser.add_argument("--excel_path", type=str, required=True)
     parser.add_argument("--selected_model", type=str, required=True)
@@ -446,6 +537,9 @@ def main():
 
     args = parser.parse_args()
 
+    # ... (Setup random seed, Wandb init, Dataset loading, Scaler...) ...
+    # (Tutto uguale a prima fino alla chiamata di training)
+    
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -453,7 +547,6 @@ def main():
 
     wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
     
-    # Load Training Data
     df = pd.read_excel(args.excel_path)
     ids_all = df["file_sorgente"].astype(str).values
     patient_ids_all = np.array([s.rsplit("_", 1)[0] for s in ids_all])
@@ -507,7 +600,6 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Model Init
     if args.selected_model == 'multi_CNN':
         model = MultiViewResNet(args.backbone, pretrained=True, hidden_dim=args.hidden_dim).to(device)
     elif args.selected_model == 'MLP_tabular':
@@ -519,7 +611,7 @@ def main():
 
     optimizer = select_optimizer(args, model)
     
-    # Training
+    # Training (Qui verrà usata la nuova funzione)
     best_val_acc = training(model, train_loader, val_loader, optimizer, args.lr, device, args.epochs, "./checkpoints_multiview", selected_model=args.selected_model)
     print("Best val accuracy:", best_val_acc)
     wandb.finish()
