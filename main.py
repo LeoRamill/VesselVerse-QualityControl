@@ -678,6 +678,10 @@ def main():
     # Start training
     best_val_acc = training(model, train_loader, val_loader, optimizer, args.lr, device, args.epochs, "./checkpoints_multiview", selected_model=args.selected_model)
     print("Best val accuracy:", best_val_acc)
+    ckpt_path = os.path.join("./checkpoints", "model.pth")
+    torch.save({"model_state_dict": model.state_dict()}, ckpt_path)
+    wandb.save(ckpt_path)
+    
     wandb.finish()
     
     # Test
