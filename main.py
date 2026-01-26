@@ -669,7 +669,7 @@ def main():
     elif args.selected_model == 'MLP_tabular':
         model = MLP_tabular(train_dataset_full.tabular_dim, 64, 128, args.hidden_dim, 0.5).to(device)
     elif args.selected_model == 'multimodal':
-        model = MultiModalMultiViewResNet(train_dataset_full.tabular_dim, args.backbone, True, 64, 128, args.hidden_dim, 0.5).to(device)
+        model = MultiModalMultiViewResNet(train_dataset_full.tabular_dim, args.backbone, True, 64, 128, args.hidden_dim, 0.6).to(device)
     else:
         print('Not supported model')
         return
