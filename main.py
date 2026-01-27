@@ -687,10 +687,10 @@ def main():
                             optimizer=optimizer, 
                             lr=args.lr, 
                             device=device, 
-                            epochs=args.epochs, 
+                            num_epochs=args.epochs, 
                             checkpoint_dir="./checkpoints_multiview", 
                             selected_model=args.selected_model,
-                            clip= args.clip)
+                            clip=args.clip)
     print("Best val accuracy:", best_val_acc)
     ckpt_path = os.path.join("./checkpoints_multiview", "model.pth")
     torch.save({"model_state_dict": model.state_dict()}, ckpt_path)
