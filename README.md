@@ -1,5 +1,5 @@
 # VesselVerse Quality Control
-![VesselVerseLogo](assets/Vessel_image.png)
+![VesselVerseLogo](assets/VesselLogo.png)
 
 This repository hosts a Deep Learning pipeline for the automated quality control of MRA (Magnetic Resonance Angiography) volumes. The project employs a multimodal approach combining Convolutional Neural Networks (Multi-View ResNet) for image analysis and an MLP for tabular data, integrated with Explainable AI (XAI) techniques like GradCAM to visualize areas of interest.
 
