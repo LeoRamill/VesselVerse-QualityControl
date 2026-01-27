@@ -1,6 +1,7 @@
 import os
 import argparse
 import random
+from xml.parsers.expat import model
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
@@ -413,7 +414,7 @@ def log_combined_plot(train_hist, val_hist, metric_name, epoch):
     plt.close() 
 
 
-def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs, save_dir="./checkpoints", use_amp=True, images_per_epoch=20, selected_model='multimodal'):
+def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs, save_dir="./checkpoints", use_amp=True, images_per_epoch=20, selected_model='multimodal', clip=1.0):
     """
     Train a multi-view model validate each epoch.
 
@@ -492,6 +493,9 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
             
             # Backpropagation
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip)
+            
             scaler.step(optimizer)
             scaler.update()
             
@@ -575,6 +579,7 @@ def main():
     parser.add_argument("--lr", type=float, default=2.5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument('--momentum', type=float, default=0.9)
+    parser.add_argument("--clip", type=int, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backbone", type=str, default="resnet18")
     parser.add_argument("--hidden_dim", type=int, default=256)
@@ -676,7 +681,16 @@ def main():
 
     optimizer = select_optimizer(args, model)
     # Start training
-    best_val_acc = training(model, train_loader, val_loader, optimizer, args.lr, device, args.epochs, "./checkpoints_multiview", selected_model=args.selected_model)
+    best_val_acc = training(model = model, 
+                            train_loader=train_loader, 
+                            val_loader=val_loader, 
+                            optimizer=optimizer, 
+                            lr=args.lr, 
+                            device=device, 
+                            epochs=args.epochs, 
+                            checkpoint_dir="./checkpoints_multiview", 
+                            selected_model=args.selected_model,
+                            clip= args.clip)
     print("Best val accuracy:", best_val_acc)
     ckpt_path = os.path.join("./checkpoints_multiview", "model.pth")
     torch.save({"model_state_dict": model.state_dict()}, ckpt_path)
