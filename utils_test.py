@@ -96,7 +96,7 @@ def generate_mips_from_nifti(nifti_path, mask_path):
             print(f"Failed to generate {key} projection for {os.path.basename(nifti_path)}")
             return None
         if key == "axial":
-            mip_raw = np.rot90(mip_raw)
+            mip_raw = np.rot90(mip_raw, k=2)
         else:
             mip_raw = ensure_portrait(mip_raw)
         # Normalize to 8-bit
