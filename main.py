@@ -688,7 +688,7 @@ def main():
                             lr=args.lr, 
                             device=device, 
                             num_epochs=args.epochs, 
-                            checkpoint_dir="./checkpoints_multiview", 
+                            save_dir="./checkpoints_multiview", 
                             selected_model=args.selected_model,
                             clip=args.clip)
     print("Best val accuracy:", best_val_acc)
