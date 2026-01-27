@@ -24,6 +24,7 @@ from utils import denorm_to_uint8, make_triplet_figure, log_val_images_to_wandb,
 
 # Import for XAI
 from utils_xai import MultiViewGradCAM, overlay_heatmap
+import joblib
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -414,7 +415,7 @@ def log_combined_plot(train_hist, val_hist, metric_name, epoch):
     plt.close() 
 
 
-def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs, save_dir="./checkpoints", use_amp=True, images_per_epoch=20, selected_model='multimodal', clip=1.0):
+def training(args, model, train_loader, val_loader, optimizer, lr, device, num_epochs, save_dir="./checkpoints", use_amp=True, images_per_epoch=20, selected_model='multimodal', clip=1.0):
     """
     Train a multi-view model validate each epoch.
 
@@ -561,6 +562,21 @@ def training(model, train_loader, val_loader, optimizer, lr, device, num_epochs,
             wandb.save(ckpt_path)
             wandb.run.summary["best_val_acc"] = best_val_acc
             print(f" Saved best model (val_acc={best_val_acc:.4f})")
+        
+    save_dir = getattr(args, 'save_model_path', './checkpoints')
+    os.makedirs(save_dir, exist_ok=True)
+    ckpt_path = os.path.join(save_dir, f"{args.model}_epoch_{epoch+1:03d}.pth")
+    checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'args': vars(args)
+        }
+    torch.save(checkpoint, ckpt_path)
+    artifact = wandb.Artifact(f"{args.model}_{epoch+1:03d}", type="model")
+    artifact.add_file(ckpt_path)
+    wandb.log_artifact(artifact)
 
     return best_val_acc
 
@@ -579,7 +595,7 @@ def main():
     parser.add_argument("--lr", type=float, default=2.5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument('--momentum', type=float, default=0.9)
-    parser.add_argument("--clip", type=int, default=1.0)
+    parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backbone", type=str, default="resnet18")
     parser.add_argument("--hidden_dim", type=int, default=256)
@@ -613,6 +629,7 @@ def main():
     # Fit scaler on training tabular data
     scaler = StandardScaler()
     scaler.fit(df.iloc[tr_rows][tab_cols].astype(np.float32).values)
+    joblib.dump(scaler, 'scaler_checkpoints/scaler.pkl')
     # Get data transforms
     train_transform, val_transform = get_transforms()
     # Prepare dataset and data loaders
@@ -681,7 +698,8 @@ def main():
 
     optimizer = select_optimizer(args, model)
     # Start training
-    best_val_acc = training(model = model, 
+    best_val_acc = training(args=args,
+                            model = model, 
                             train_loader=train_loader, 
                             val_loader=val_loader, 
                             optimizer=optimizer, 

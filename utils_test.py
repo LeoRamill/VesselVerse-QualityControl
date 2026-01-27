@@ -14,7 +14,7 @@ from models.multi_resnet import MultiViewResNet
 from models.multi_modal_resnet import MultiModalMultiViewResNet
 from models.mlp import MLP_tabular
 from utils_xai import MultiViewGradCAM, overlay_heatmap_original_size
-
+from visualization.max_intensity_proj import maximum_intensity_projection, normalize_to_8bit
 
 try:
     import VESSEL_METRICS
@@ -71,36 +71,44 @@ def to_uint8_rgb(mip):
     mip = mip.astype(np.uint8)
     return np.stack([mip, mip, mip], axis=-1)
 
-def generate_mips_from_nifti(nifti_path):
+def generate_mips_from_nifti(nifti_path, mask_path):
     """
     Generate MIPs (Maximum Intensity Projections) from a NIfTI file.
     
     Parameters:
         nifti_path: Path al file NIfTI
+        mask_path: Path al file di segmentazione NIfTI
     Returns:
         dict: dictionary with keys 'axial', 'sagittal', 'coronal' and values as RGB uint8 images.
     """
-    try:
-        img_obj = nib.load(nifti_path)
-        data = img_obj.get_fdata()
-    except Exception as e:
-        print(f"Error reading NIfTI {os.path.basename(nifti_path)}: {e}")
-        return None
-    
-    mip_ax = np.max(data, axis=2)
-    mip_sag = np.max(data, axis=0)
-    mip_cor = np.max(data, axis=1)
-
-    # Standard orientation
-    mip_ax = np.rot90(mip_ax)
-    mip_sag = ensure_portrait(mip_sag)
-    mip_cor = ensure_portrait(mip_cor)
-
-    return {
-        "axial": to_uint8_rgb(mip_ax),
-        "sagittal": to_uint8_rgb(mip_sag),
-        "coronal": to_uint8_rgb(mip_cor)
+    # 
+    projections = {
+        "axial": "axial",
+        "sagittal": "sagittal",
+        "coronal": "coronal"
     }
+    
+    output_dict = {}
+
+    for key, proj_dim in projections.items():
+        mip_raw, _ = maximum_intensity_projection(nifti_path, proj_dim, mask_filepath=mask_path)
+        
+        if mip_raw is None:
+            print(f"Failed to generate {key} projection for {os.path.basename(nifti_path)}")
+            return None
+        if key == "axial":
+            mip_raw = np.rot90(mip_raw)
+        else:
+            mip_raw = ensure_portrait(mip_raw)
+        # Normalize to 8-bit
+        mip_uint8 = normalize_to_8bit(mip_raw)
+
+        # Convert to RGB
+        mip_rgb = np.stack([mip_uint8, mip_uint8, mip_uint8], axis=-1)
+
+        output_dict[key] = mip_rgb
+
+    return output_dict
 
 def extract_features_from_nifti(nifti_path, feature_names_ordered):
     """

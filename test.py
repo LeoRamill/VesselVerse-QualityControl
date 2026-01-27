@@ -14,6 +14,7 @@ from models.multi_modal_resnet import MultiModalMultiViewResNet
 from models.mlp import MLP_tabular
 
 from utils_xai import MultiViewGradCAM, overlay_heatmap_original_size
+import joblib
 
 from utils_test import get_val_transform, ensure_portrait, to_uint8_rgb, generate_mips_from_nifti, extract_features_from_nifti
 
@@ -50,9 +51,14 @@ def run_single_test(args):
     tab_cols = [c for c in numeric_cols if c not in drop_cols]
     
     scaler = StandardScaler()
-    scaler.fit(df[tab_cols].astype(np.float32).values)
     tabular_dim = len(tab_cols)
     print(f"Training {tabular_dim} tabular features.")
+
+    if args.scaler_path and os.path.exists(args.scaler_path):
+        print(f"Loading saved scaler from: {args.scaler_path}")
+        scaler = joblib.load(args.scaler_path)
+    else:
+        scaler.fit(df[tab_cols].astype(np.float32).values)
 
     # Initialize Model
     print(f"Loading model: {args.selected_model}")
@@ -87,7 +93,7 @@ def run_single_test(args):
     mips = None
     if args.selected_model in ['multi_CNN', 'multimodal']:
         # Generate MIPs
-        mips = generate_mips_from_nifti(args.nifti_path)
+        mips = generate_mips_from_nifti(args.nifti_path, args.mask_path)
         # Preprocess MIPs
         transform = get_val_transform()
         for view in ['axial', 'sagittal', 'coronal']:
@@ -172,9 +178,10 @@ def run_single_test(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Single NIfTI Test with GradCAM Visualization")
     parser.add_argument("--nifti_path", type=str, required=True, help="Path al file NIfTI di input")
+    parser.add_argument("--mask_path", type=str, required=True, help="Path al file segmentation di input")
     parser.add_argument("--checkpoint_path", type=str, required=True, help="Path al checkpoint del modello")
     parser.add_argument("--excel_path", type=str, required=True, help="Original Excel")
-    
+    parser.add_argument("--scaler_path", type=str, default=None)
     parser.add_argument("--selected_model", type=str, default="multimodal")
     parser.add_argument("--backbone", type=str, default="resnet18")
     parser.add_argument("--hidden_dim", type=int, default=256)
