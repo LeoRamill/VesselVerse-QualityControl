@@ -81,7 +81,11 @@ Use `test.py` to analyze a single `.nii.gz` volume. The script loads the trained
 
 - `--nifti_path`: Path to the input NIfTI file.
 
+- `--mask_path`: Path to the segmentation of NIfTI file.
+
 - `--checkpoint_path`: Path to the saved model .pth file.
+
+- `--scaler_path`: Path to the scaler `.pth` file.
 
 - `--excel_path`: Path to the original Excel file (used to fit the scaler on tabular data).
 
@@ -91,6 +95,7 @@ Use `test.py` to analyze a single `.nii.gz` volume. The script loads the trained
 ```bash
 python test.py \
   --nifti_path "/content/sample_volume.nii.gz" \
+  --mask_path "/content/sample_segmentation.nii.gz" \
   --checkpoint_path "/content/model_checkpoint.pth" \
   --excel_path "/content/dataset_originale.xlsx" \
   --selected_model "multimodal"
@@ -107,7 +112,11 @@ Use `multiple_test.py` to automatically process all `.nii.gz` files within a spe
 
 - `--input_folder`: Folder containing the `.nii.gz` files to test.
 
+- `--mask_folder`: Folder containing the `.nii.gz` segmentation files to test.
+
 - `--output_folder`: Folder where output images and the result Excel will be saved.
+
+- `--segmentation_model`: Name of Segmentation to Analyze.
 
 - `--checkpoint_path`: Path to the model `.pth` file.
 
@@ -119,7 +128,9 @@ Use `multiple_test.py` to automatically process all `.nii.gz` files within a spe
 ```bash
 python multiple_test.py \
   --input_folder "/content/test_folder_IXI" \
+  --mask_folder "/content/test_folder_segmentation_IXI" \
   --output_folder "/content/output_results" \
+  --segmentation_model "name_segmentation"\
   --checkpoint_path "/content/model_checkpoint.pth" \
   --excel_path "/content/dataset_originale.xlsx" \
   --selected_model "multimodal"
