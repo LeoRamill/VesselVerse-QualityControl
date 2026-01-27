@@ -88,6 +88,7 @@ def run_single_test(args):
 
     # Input Generation
     print(f"\nAnalysis Patient: {args.nifti_path}")
+    print(f"\nAnalysis Segmentation: {args.mask_path}")
     inputs = {}
 
     mips = None
@@ -101,7 +102,7 @@ def run_single_test(args):
             inputs[view] = transform(img_pil).unsqueeze(0).to(device)
 
     if args.selected_model in ['MLP_tabular', 'multimodal']:
-        raw_feats = extract_features_from_nifti(args.nifti_path, tab_cols)
+        raw_feats = extract_features_from_nifti(args.mask_path, tab_cols)
         feats_scaled = scaler.transform(raw_feats.reshape(1, -1))
         inputs['tabular'] = torch.tensor(feats_scaled, dtype=torch.float32).to(device)
 

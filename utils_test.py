@@ -28,7 +28,6 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-
 def get_val_transform():
     """
     Transform Validation: Resize, ToTensor, Normalize.
