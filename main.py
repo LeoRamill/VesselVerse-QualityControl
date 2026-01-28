@@ -629,6 +629,7 @@ def main():
     # Fit scaler on training tabular data
     scaler = StandardScaler()
     scaler.fit(df.iloc[tr_rows][tab_cols].astype(np.float32).values)
+    os.makedirs('scaler_checkpoints', exist_ok=True)
     joblib.dump(scaler, 'scaler_checkpoints/scaler.pkl')
     # Get data transforms
     train_transform, val_transform = get_transforms()
