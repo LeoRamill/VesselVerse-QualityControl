@@ -574,7 +574,7 @@ def training(args, model, train_loader, val_loader, optimizer, lr, device, num_e
             'args': vars(args)
         }
     torch.save(checkpoint, ckpt_path)
-    artifact = wandb.Artifact(f"{args.model}_{epoch+1:03d}", type="model")
+    artifact = wandb.Artifact(f"{args.selected_model}_{epoch+1:03d}", type="model")
     artifact.add_file(ckpt_path)
     wandb.log_artifact(artifact)
 
