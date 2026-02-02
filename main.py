@@ -565,7 +565,7 @@ def training(args, model, train_loader, val_loader, optimizer, lr, device, num_e
         
     save_dir = getattr(args, 'save_model_path', './checkpoints')
     os.makedirs(save_dir, exist_ok=True)
-    ckpt_path = os.path.join(save_dir, f"{args.model}_epoch_{epoch+1:03d}.pth")
+    ckpt_path = os.path.join(save_dir, f"{args.selected_model}_epoch_{epoch+1:03d}.pth")
     checkpoint = {
             'epoch': epoch + 1,
             'model_state_dict': model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict(),
