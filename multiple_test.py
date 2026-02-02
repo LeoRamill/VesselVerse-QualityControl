@@ -1,3 +1,4 @@
+from ast import Return
 import os
 import glob
 import argparse
@@ -11,6 +12,9 @@ from sklearn.preprocessing import StandardScaler
 import nibabel as nib
 from torchvision import transforms
 from tqdm import tqdm 
+
+import re
+from pathlib import Path
 
 from models.multi_resnet import MultiViewResNet
 from models.multi_modal_resnet import MultiModalMultiViewResNet
@@ -142,12 +146,36 @@ def process_single_case(nifti_path, mask_path, model, device, scaler, tab_cols, 
         
     return pred, prob, montage_bgr
 
+def path_by_id(folder, file_id):
+    """
+    Finds the absolute path of a .nii.gz file containing a specific ID.
+
+    Args:
+        folder (str): The directory to search in.
+        file_id (str or int): The unique ID (e.g., "IXI123").
+
+    Returns:
+        str: The complete absolute path to the file.
+
+    Raises:
+        FileNotFoundError: If no file matching the ID is found.
+    """
+    # Create a Path object and search for the pattern
+    search_pattern = f"{file_id}.nii.gz"
+    matches = list(Path(folder).glob(search_pattern))
+
+    if not matches:
+        return None  # or raise FileNotFoundError(f"No file found for ID: {file_id}")
+
+    # Return the absolute path of the first match as a string
+    return str(matches[0].resolve())
 
 def run_batch_test(args):
     """
     Run batch testing on a folder of NIfTI files.
     Parameters:
         args: Parsed command-line arguments
+        
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Use device: {device}")
@@ -183,7 +211,7 @@ def run_batch_test(args):
         model = MLP_tabular(tabular_dim=tabular_dim, tab_emb_dim=64, tab_hidden=128, hidden_layer=args.hidden_dim).to(device)
     elif args.selected_model == 'multimodal':
         model = MultiModalMultiViewResNet(
-            tabular_dim=tabular_dim, backbone_name=args.backbone, pretrained=False, 
+            tabular_dim=tabular_dim, backbone_name=args.backbone, pretrained=False,
             tab_emb_dim=64, tab_hidden=128, fusion_hidden=args.hidden_dim
         ).to(device)
     
@@ -197,36 +225,55 @@ def run_batch_test(args):
     
     model.eval()
     transform = get_val_transform()
+    
+    # Extract unique IDs from the input folder using Regex (looking for pattern IXI + 3 digits)
+    regex_pattern = r'(IXI\d{3}|Normal\d{3}-MRA)'
+    
+    raw_ids = []
+    if os.path.exists(args.input_folder):
+        raw_ids = [
+            re.search(regex_pattern, fname).group(0) 
+            for fname in os.listdir(args.input_folder) 
+            if re.search(regex_pattern, fname)
+        ]
+    
+    # Remove duplicates and sort
+    raw_ids = sorted(list(set(raw_ids)))
 
-    # We look for NIfTIs in input_folder, and assume corresponding masks are in mask_folder
-    search_path = os.path.join(args.input_folder, "*.nii.gz")
-    files = glob.glob(search_path)
-    if not files:
-        print(f"No .nii.gz files found in {args.input_folder}")
+    if not raw_ids:
+        print(f"No valid IDs (IXI...) found in {args.input_folder}")
         return
 
-    print(f"Found {len(files)} cases to analyze.")
+    print(f"Found {len(raw_ids)} unique IDs to analyze.")
 
-    # Process each file
+    # Process each case based on ID
     results_list = []
     
     # Progress bar with tqdm if available
-    iterator = tqdm(files, desc="Processing") if 'tqdm' in globals() else files
-
-    for nifti_path in iterator:
-        filename = os.path.basename(nifti_path)
+    iterator = tqdm(raw_ids, desc="Processing") if 'tqdm' in globals() else raw_ids
+    
+    for case_id in iterator:
+        # Find absolute path for the input image using the ID
+        nifti_path = path_by_id(args.input_folder, case_id)
         
-        # Determine mask path (assuming same filename in mask_folder)
-        mask_path = os.path.join(args.mask_folder, filename)
-        
-        if (not os.path.exists(mask_path)) and (len(args.segmentation_model) > 0):
-            mask_path = os.path.join(args.mask_folder+'_'+ args.segmentation_model, filename)
-            if not os.path.exists(mask_path):
-                print(f"Warning: Mask not found for {filename}. Skipping.")
-                continue
+        if nifti_path is None:
+            print(f"Warning: Image file not found for ID {case_id}. Skipping.")
+            continue
             
-        elif not os.path.exists(mask_path):
-            print(f"Warning: Mask not found for {filename}. Skipping.")
+        filename = os.path.basename(nifti_path)
+
+        # Determine mask path using the ID
+        # First check the main mask folder
+        mask_path = path_by_id(args.mask_folder, case_id)
+        
+        # If not found and a segmentation model suffix is provided, check the alternative folder
+        if (mask_path is None) and (args.segmentation_model is not None) and (len(args.segmentation_model) > 0):
+            alt_mask_folder = args.mask_folder + '_' + args.segmentation_model
+            if os.path.exists(alt_mask_folder):
+                mask_path = path_by_id(alt_mask_folder, case_id)
+
+        if mask_path is None:
+            print(f"Warning: Mask not found for ID {case_id}. Skipping.")
             continue
 
         # Process single case
@@ -238,11 +285,11 @@ def run_batch_test(args):
             # Save Results Data
             results_list.append({
                 "Filename": filename,
+                "Case_ID": case_id,
                 "Prediction": int(pred),
                 "Probability": float(prob),
                 "Label": "Good" if pred == 1 else "Bad"
             })
-            
             # Save Image
             if img_result is not None:
                 out_img_name = filename.replace(".nii.gz", "_result.jpg")
@@ -256,9 +303,9 @@ def run_batch_test(args):
         df_results = pd.DataFrame(results_list)
         # Sort by Filename
         df_results.sort_values(by="Filename", inplace=True)
-        
         out_excel_path = os.path.join(args.output_folder, "Results_Summary.xlsx")
         df_results.to_excel(out_excel_path, index=False)
+        
         print("\n" + "="*50)
         print(f"COMPLETED.")
         print(f"Excel saved in: {out_excel_path}")
