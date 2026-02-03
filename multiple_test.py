@@ -149,23 +149,27 @@ def process_single_case(nifti_path, mask_path, model, device, scaler, tab_cols, 
 def path_by_id(folder, file_id):
     """
     Finds the absolute path of a .nii.gz file containing a specific ID.
+    It uses wildcards (*ID*) so it finds the file even if the name is complex.
 
     Args:
         folder (str): The directory to search in.
-        file_id (str or int): The unique ID (e.g., "IXI123").
+        file_id (str): The unique ID (e.g., "IXI123").
 
     Returns:
         str: The complete absolute path to the file.
-
-    Raises:
-        FileNotFoundError: If no file matching the ID is found.
     """
-    # Create a Path object and search for the pattern
-    search_pattern = f"{file_id}.nii.gz"
+    # Create a Path object and search for the pattern using wildcards
+    # This matches "IXI123.nii.gz", "IXI123-Guys-0828.nii.gz", etc.
+    search_pattern = f"*{file_id}*.nii.gz"
+    
+    # Check if folder exists to avoid crash
+    if not os.path.exists(folder):
+        return None
+
     matches = list(Path(folder).glob(search_pattern))
 
     if not matches:
-        return None  # or raise FileNotFoundError(f"No file found for ID: {file_id}")
+        return None 
 
     # Return the absolute path of the first match as a string
     return str(matches[0].resolve())
@@ -175,7 +179,6 @@ def run_batch_test(args):
     Run batch testing on a folder of NIfTI files.
     Parameters:
         args: Parsed command-line arguments
-        
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Use device: {device}")
@@ -225,9 +228,11 @@ def run_batch_test(args):
     
     model.eval()
     transform = get_val_transform()
-    
-    # Extract unique IDs from the input folder using Regex (looking for pattern IXI + 3 digits)
-    regex_pattern = r'(IXI\d{3}|Normal\d{3}-MRA)'
+
+    # Extract unique IDs using Regex
+    # We only look for the ID part (e.g., "IXI002") inside the filename.
+    # This ignores complex suffixes like "-Guys-0828-MRA" during the ID extraction phase.
+    regex_pattern = r'(IXI\d{3}|Normal\d{3})'
     
     raw_ids = []
     if os.path.exists(args.input_folder):
@@ -237,16 +242,15 @@ def run_batch_test(args):
             if re.search(regex_pattern, fname)
         ]
     
-    # Remove duplicates and sort
+    # Remove duplicates and sort to ensure unique processing
     raw_ids = sorted(list(set(raw_ids)))
 
     if not raw_ids:
-        print(f"No valid IDs (IXI...) found in {args.input_folder}")
+        print(f"No valid IDs (matching {regex_pattern}) found in {args.input_folder}")
         return
 
     print(f"Found {len(raw_ids)} unique IDs to analyze.")
 
-    # Process each case based on ID
     results_list = []
     
     # Progress bar with tqdm if available
@@ -254,6 +258,8 @@ def run_batch_test(args):
     
     for case_id in iterator:
         # Find absolute path for the input image using the ID
+        # The path_by_id function will use *case_id* to find the full filename
+        # (e.g., it will match ID "IXI002" to file "IXI002-Guys-0828-MRA.nii.gz")
         nifti_path = path_by_id(args.input_folder, case_id)
         
         if nifti_path is None:
@@ -269,6 +275,7 @@ def run_batch_test(args):
         # If not found and a segmentation model suffix is provided, check the alternative folder
         if (mask_path is None) and (args.segmentation_model is not None) and (len(args.segmentation_model) > 0):
             alt_mask_folder = args.mask_folder + '_' + args.segmentation_model
+            # Only search if the folder actually exists
             if os.path.exists(alt_mask_folder):
                 mask_path = path_by_id(alt_mask_folder, case_id)
 
@@ -277,6 +284,7 @@ def run_batch_test(args):
             continue
 
         # Process single case
+        # Assuming process_single_case handles the actual inference
         pred, prob, img_result = process_single_case(
             nifti_path, mask_path, model, device, scaler, tab_cols, transform, args
         )
@@ -290,7 +298,8 @@ def run_batch_test(args):
                 "Probability": float(prob),
                 "Label": "Good" if pred == 1 else "Bad"
             })
-            # Save Image
+            
+            # Save Image Result
             if img_result is not None:
                 out_img_name = filename.replace(".nii.gz", "_result.jpg")
                 out_img_path = os.path.join(args.output_folder, out_img_name)
@@ -298,6 +307,7 @@ def run_batch_test(args):
         else:
             # Logging handled inside process_single_case if None is returned
             pass
+
     # Save Excel Summary
     if results_list:
         df_results = pd.DataFrame(results_list)
@@ -316,7 +326,6 @@ def run_batch_test(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch Test Script with Masks and GradCAM")
-    
     parser.add_argument("--input_folder", type=str, required=True, help="Folder with raw NIfTI files")
     parser.add_argument("--mask_folder", type=str, required=True, help="Folder with segmentation NIfTI files")
     parser.add_argument("--output_folder", type=str, required=True, help="Folder where to save images and excel")
@@ -324,11 +333,9 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_path", type=str, required=True, help="Path of the model .pth")
     parser.add_argument("--excel_path", type=str, required=True, help="Original Excel for the scaler (features reference)")
     parser.add_argument("--scaler_path", type=str, default=None, help="Path to saved joblib scaler (optional)")
-    
     parser.add_argument("--selected_model", type=str, default="multimodal")
     parser.add_argument("--backbone", type=str, default="resnet18")
     parser.add_argument("--hidden_dim", type=int, default=256)
 
     args = parser.parse_args()
-    
     run_batch_test(args)
